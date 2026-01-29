@@ -73,8 +73,8 @@ This driver provides full force feedback support, including condition effects, a
 ### Step 1: Build the Driver
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/logitech-rs50-driver.git
-cd logitech-rs50-driver/mainline
+git clone https://github.com/mescon/logitech-rs50-linux-driver.git
+cd logitech-rs50-linux-driver/mainline
 make
 ```
 

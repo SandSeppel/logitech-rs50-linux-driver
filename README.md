@@ -149,20 +149,21 @@ fftest /dev/input/by-id/usb-Logitech_RS50*-event-joystick
 
 ### Configure Settings via sysfs
 
-Settings are exposed at `/sys/class/hidraw/hidrawX/device/` where X is typically 4 for the RS50.
+Settings are exposed at `/sys/class/hidraw/hidrawX/device/` (where X varies by system).
 
 ```bash
-# Find the correct hidraw device
-ls /sys/class/hidraw/*/device/rs50_range 2>/dev/null
+# Find your RS50's hidraw device
+RS50_DEV=$(ls -d /sys/class/hidraw/*/device/rs50_range 2>/dev/null | head -1 | xargs dirname)
+echo "RS50 found at: $RS50_DEV"
 
 # Example: Set rotation to 900 degrees
-echo 900 | sudo tee /sys/class/hidraw/hidraw4/device/rs50_range
+echo 900 | sudo tee $RS50_DEV/rs50_range
 
 # Example: Set FFB strength to 80%
-echo 80 | sudo tee /sys/class/hidraw/hidraw4/device/rs50_strength
+echo 80 | sudo tee $RS50_DEV/rs50_strength
 
 # Example: Set LED to static effect
-echo 5 | sudo tee /sys/class/hidraw/hidraw4/device/rs50_led_effect
+echo 5 | sudo tee $RS50_DEV/rs50_led_effect
 ```
 
 ### Available sysfs Attributes
@@ -335,8 +336,11 @@ SDL_JOYSTICK_HIDAPI=0 %command%
 If Oversteer or sysfs settings don't work, Wine may have grabbed the hidraw device:
 
 ```bash
-# Check who has the device open
-sudo lsof /dev/hidraw4
+# Find your RS50's hidraw device number
+ls -la /sys/class/hidraw/*/device/rs50_range 2>/dev/null
+
+# Check who has the device open (replace X with your hidraw number)
+sudo lsof /dev/hidrawX
 
 # If wine processes are listed, close them or use Solution 1
 ```

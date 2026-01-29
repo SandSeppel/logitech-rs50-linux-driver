@@ -6629,15 +6629,17 @@ static int rs50_process_dpad(struct hidpp_device *hidpp, u8 *data, int size)
 	if (!hidpp || !(hidpp->quirks & HIDPP_QUIRK_RS50_FFB))
 		return 0;
 
-	ff = hidpp->private_data;
-	if (!ff || !ff->input)
+	ff = READ_ONCE(hidpp->private_data);
+	if (!ff)
 		return 0;
 
 	/* Don't process during shutdown */
 	if (atomic_read_acquire(&ff->stopping))
 		return 0;
 
-	input = ff->input;
+	input = READ_ONCE(ff->input);
+	if (!input)
+		return 0;
 
 	/* Check if this is a joystick report (should be 30 bytes from interface 0) */
 	if (size < 4)
@@ -6780,7 +6782,7 @@ static void rs50_process_pedals(struct hidpp_device *hidpp, u8 *data, int size)
 	if (!hidpp || !(hidpp->quirks & HIDPP_QUIRK_RS50_FFB))
 		return;
 
-	ff = hidpp->private_data;
+	ff = READ_ONCE(hidpp->private_data);
 	if (!ff)
 		return;
 

@@ -98,6 +98,6 @@ fftest /dev/input/eventX
 
 ## Status
 
-**Current**: Fully functional driver ready for release
+**Current**: Under active development - may contain bugs or incomplete features
 **Features**: Force feedback (constant + condition effects), all buttons, sysfs settings
 **Date**: 2026-01-29

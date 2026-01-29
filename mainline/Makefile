@@ -1,14 +1,10 @@
 KVERSION := $(shell uname -r)
 KDIR := /lib/modules/$(KVERSION)/build
 
-# Use clang to match kernel build
-CC := clang
-LLVM := 1
-
 obj-m := hid-logitech-hidpp.o
 
 all:
-	$(MAKE) -C $(KDIR) M=$(PWD) CC=$(CC) LLVM=$(LLVM) modules
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean

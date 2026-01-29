@@ -3,6 +3,7 @@ KDIR := /lib/modules/$(KVERSION)/build
 
 obj-m := hid-logitech-hidpp.o
 
+# Use: make CC=clang LLVM=1   for clang builds
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 

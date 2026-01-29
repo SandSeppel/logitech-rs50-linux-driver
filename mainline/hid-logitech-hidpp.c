@@ -23,10 +23,12 @@
 #include <linux/workqueue.h>
 #include <linux/atomic.h>
 #include <linux/fixp-arith.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
+#include <linux/math.h>
 #include "usbhid/usbhid.h"
 #include "hid-ids.h"
 
+MODULE_DESCRIPTION("Support for Logitech devices relying on the HID++ specification");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Benjamin Tissoires <benjamin.tissoires@gmail.com>");
 MODULE_AUTHOR("Nestor Lopez Casado <nlopezcasad@logitech.com>");
@@ -69,12 +71,13 @@ MODULE_PARM_DESC(disable_tap_to_click,
 #define HIDPP_QUIRK_WTP_PHYSICAL_BUTTONS	BIT(22)
 #define HIDPP_QUIRK_DELAYED_INIT		BIT(23)
 #define HIDPP_QUIRK_FORCE_OUTPUT_REPORTS	BIT(24)
-#define HIDPP_QUIRK_UNIFYING			BIT(25)
-#define HIDPP_QUIRK_HIDPP_WHEELS		BIT(26)
-#define HIDPP_QUIRK_HIDPP_EXTRA_MOUSE_BTNS	BIT(27)
-#define HIDPP_QUIRK_HIDPP_CONSUMER_VENDOR_KEYS	BIT(28)
-#define HIDPP_QUIRK_HI_RES_SCROLL_1P0		BIT(29)
-#define HIDPP_QUIRK_WIRELESS_STATUS		BIT(30)
+#define HIDPP_QUIRK_HIDPP_WHEELS		BIT(25)
+#define HIDPP_QUIRK_HIDPP_EXTRA_MOUSE_BTNS	BIT(26)
+#define HIDPP_QUIRK_HIDPP_CONSUMER_VENDOR_KEYS	BIT(27)
+#define HIDPP_QUIRK_HI_RES_SCROLL_1P0		BIT(28)
+#define HIDPP_QUIRK_WIRELESS_STATUS		BIT(29)
+#define HIDPP_QUIRK_RESET_HI_RES_SCROLL		BIT(30)
+#define HIDPP_QUIRK_RS50_FFB			BIT(31)
 
 /* These are just aliases for now */
 #define HIDPP_QUIRK_KBD_SCROLL_WHEEL HIDPP_QUIRK_HIDPP_WHEELS
@@ -193,8 +196,8 @@ struct hidpp_device {
 	void *private_data;
 
 	struct work_struct work;
+	struct work_struct reset_hi_res_work;
 	struct kfifo delayed_work_fifo;
-	atomic_t connected;
 	struct input_dev *delayed_input;
 
 	unsigned long quirks;
@@ -205,6 +208,8 @@ struct hidpp_device {
 	struct hidpp_scroll_counter vertical_wheel_counter;
 
 	u8 wireless_feature_index;
+
+	bool connected_once;
 };
 
 /* HID++ 1.0 error codes */
@@ -228,14 +233,12 @@ struct hidpp_device {
 #define HIDPP20_ERROR_INVALID_ARGS		0x02
 #define HIDPP20_ERROR_OUT_OF_RANGE		0x03
 #define HIDPP20_ERROR_HW_ERROR			0x04
-#define HIDPP20_ERROR_LOGITECH_INTERNAL		0x05
+#define HIDPP20_ERROR_NOT_ALLOWED		0x05
 #define HIDPP20_ERROR_INVALID_FEATURE_INDEX	0x06
 #define HIDPP20_ERROR_INVALID_FUNCTION_ID	0x07
 #define HIDPP20_ERROR_BUSY			0x08
 #define HIDPP20_ERROR_UNSUPPORTED		0x09
 #define HIDPP20_ERROR				0xff
-
-static void hidpp_connect_event(struct hidpp_device *hidpp_dev);
 
 static int __hidpp_send_report(struct hid_device *hdev,
 				struct hidpp_report *hidpp_report)
@@ -275,21 +278,22 @@ static int __hidpp_send_report(struct hid_device *hdev,
 }
 
 /*
- * hidpp_send_message_sync() returns 0 in case of success, and something else
- * in case of a failure.
- * - If ' something else' is positive, that means that an error has been raised
- *   by the protocol itself.
- * - If ' something else' is negative, that means that we had a classic error
- *   (-ENOMEM, -EPIPE, etc...)
+ * Effectively send the message to the device, waiting for its answer.
+ *
+ * Must be called with hidpp->send_mutex locked
+ *
+ * Same return protocol than hidpp_send_message_sync():
+ * - success on 0
+ * - negative error means transport error
+ * - positive value means protocol error
  */
-static int hidpp_send_message_sync(struct hidpp_device *hidpp,
+static int __do_hidpp_send_message_sync(struct hidpp_device *hidpp,
 	struct hidpp_report *message,
 	struct hidpp_report *response)
 {
-	int ret = -1;
-	int max_retries = 3;
+	int ret;
 
-	mutex_lock(&hidpp->send_mutex);
+	__must_hold(&hidpp->send_mutex);
 
 	hidpp->send_receive_buf = response;
 	hidpp->answer_available = false;
@@ -300,47 +304,79 @@ static int hidpp_send_message_sync(struct hidpp_device *hidpp,
 	 */
 	*response = *message;
 
-	for (; max_retries != 0 && ret; max_retries--) {
-		ret = __hidpp_send_report(hidpp->hid_dev, message);
+	ret = __hidpp_send_report(hidpp->hid_dev, message);
+	if (ret) {
+		dbg_hid("__hidpp_send_report returned err: %d\n", ret);
+		memset(response, 0, sizeof(struct hidpp_report));
+		return ret;
+	}
 
-		if (ret) {
-			dbg_hid("__hidpp_send_report returned err: %d\n", ret);
-			memset(response, 0, sizeof(struct hidpp_report));
-			break;
-		}
+	if (!wait_event_timeout(hidpp->wait, hidpp->answer_available,
+				5*HZ)) {
+		dbg_hid("%s:timeout waiting for response\n", __func__);
+		memset(response, 0, sizeof(struct hidpp_report));
+		return -ETIMEDOUT;
+	}
 
-		if (!wait_event_timeout(hidpp->wait, hidpp->answer_available,
-					5*HZ)) {
-			dbg_hid("%s:timeout waiting for response\n", __func__);
-			memset(response, 0, sizeof(struct hidpp_report));
-			ret = -ETIMEDOUT;
-			break;
-		}
+	if (response->report_id == REPORT_ID_HIDPP_SHORT &&
+	    response->rap.sub_id == HIDPP_ERROR) {
+		ret = response->rap.params[1];
+		dbg_hid("%s:got hidpp error %02X\n", __func__, ret);
+		return ret;
+	}
 
+	if ((response->report_id == REPORT_ID_HIDPP_LONG ||
+	     response->report_id == REPORT_ID_HIDPP_VERY_LONG) &&
+	    response->fap.feature_index == HIDPP20_ERROR) {
+		ret = response->fap.params[1];
+		dbg_hid("%s:got hidpp 2.0 error %02X\n", __func__, ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+/*
+ * hidpp_send_message_sync() returns 0 in case of success, and something else
+ * in case of a failure.
+ *
+ * See __do_hidpp_send_message_sync() for a detailed explanation of the returned
+ * value.
+ */
+static int hidpp_send_message_sync(struct hidpp_device *hidpp,
+	struct hidpp_report *message,
+	struct hidpp_report *response)
+{
+	int ret;
+	int max_retries = 3;
+
+	mutex_lock(&hidpp->send_mutex);
+
+	do {
+		ret = __do_hidpp_send_message_sync(hidpp, message, response);
 		if (response->report_id == REPORT_ID_HIDPP_SHORT &&
-		    response->rap.sub_id == HIDPP_ERROR) {
-			ret = response->rap.params[1];
-			dbg_hid("%s:got hidpp error %02X\n", __func__, ret);
+		    ret != HIDPP_ERROR_BUSY)
 			break;
-		}
-
 		if ((response->report_id == REPORT_ID_HIDPP_LONG ||
 		     response->report_id == REPORT_ID_HIDPP_VERY_LONG) &&
-		    response->fap.feature_index == HIDPP20_ERROR) {
-			ret = response->fap.params[1];
-			if (ret != HIDPP20_ERROR_BUSY) {
-				dbg_hid("%s:got hidpp 2.0 error %02X\n", __func__, ret);
-				break;
-			}
-			dbg_hid("%s:got busy hidpp 2.0 error %02X, retrying\n", __func__, ret);
-		}
-	}
+		    ret != HIDPP20_ERROR_BUSY)
+			break;
+
+		dbg_hid("%s:got busy hidpp error %02X, retrying\n", __func__, ret);
+	} while (--max_retries);
 
 	mutex_unlock(&hidpp->send_mutex);
 	return ret;
 
 }
 
+/*
+ * hidpp_send_fap_command_sync() returns 0 in case of success, and something else
+ * in case of a failure.
+ *
+ * See __do_hidpp_send_message_sync() for a detailed explanation of the returned
+ * value.
+ */
 static int hidpp_send_fap_command_sync(struct hidpp_device *hidpp,
 	u8 feat_index, u8 funcindex_clientid, u8 *params, int param_count,
 	struct hidpp_report *response)
@@ -360,7 +396,16 @@ static int hidpp_send_fap_command_sync(struct hidpp_device *hidpp,
 	if (!message)
 		return -ENOMEM;
 
-	if (param_count > (HIDPP_REPORT_LONG_LENGTH - 4))
+	/*
+	 * RS50 racing wheel requires SHORT reports (0x10) for HID++ commands.
+	 * Unlike most FAP devices that use LONG (0x11), the RS50 ignores LONG
+	 * reports and only responds to SHORT. It always responds with VERY_LONG
+	 * (0x12) regardless of input report type. Use SHORT when possible.
+	 */
+	if ((hidpp->quirks & HIDPP_QUIRK_RS50_FFB) &&
+	    param_count <= (HIDPP_REPORT_SHORT_LENGTH - 4))
+		message->report_id = REPORT_ID_HIDPP_SHORT;
+	else if (param_count > (HIDPP_REPORT_LONG_LENGTH - 4))
 		message->report_id = REPORT_ID_HIDPP_VERY_LONG;
 	else
 		message->report_id = REPORT_ID_HIDPP_LONG;
@@ -373,6 +418,13 @@ static int hidpp_send_fap_command_sync(struct hidpp_device *hidpp,
 	return ret;
 }
 
+/*
+ * hidpp_send_rap_command_sync() returns 0 in case of success, and something else
+ * in case of a failure.
+ *
+ * See __do_hidpp_send_message_sync() for a detailed explanation of the returned
+ * value.
+ */
 static int hidpp_send_rap_command_sync(struct hidpp_device *hidpp_dev,
 	u8 report_id, u8 sub_id, u8 reg_address, u8 *params, int param_count,
 	struct hidpp_report *response)
@@ -415,16 +467,23 @@ static int hidpp_send_rap_command_sync(struct hidpp_device *hidpp_dev,
 	return ret;
 }
 
-static void delayed_work_cb(struct work_struct *work)
-{
-	struct hidpp_device *hidpp = container_of(work, struct hidpp_device,
-							work);
-	hidpp_connect_event(hidpp);
-}
-
 static inline bool hidpp_match_answer(struct hidpp_report *question,
 		struct hidpp_report *answer)
 {
+	/*
+	 * Some devices (e.g., RS50 racing wheel) don't echo back the software
+	 * ID in the response's funcindex_clientid field - they only return
+	 * the function index in the upper nibble, leaving the lower nibble
+	 * as 0. Handle this by only comparing the function index (upper nibble)
+	 * when the response's SW_ID is 0.
+	 */
+	if ((answer->fap.funcindex_clientid & 0x0f) == 0) {
+		/* Device didn't echo SW_ID - compare function ID only */
+		return (answer->fap.feature_index == question->fap.feature_index) &&
+		       ((answer->fap.funcindex_clientid & 0xf0) ==
+			(question->fap.funcindex_clientid & 0xf0));
+	}
+
 	return (answer->fap.feature_index == question->fap.feature_index) &&
 	   (answer->fap.funcindex_clientid == question->fap.funcindex_clientid);
 }
@@ -901,7 +960,7 @@ static int hidpp_unifying_init(struct hidpp_device *hidpp)
 #define CMD_ROOT_GET_PROTOCOL_VERSION			0x10
 
 static int hidpp_root_get_feature(struct hidpp_device *hidpp, u16 feature,
-	u8 *feature_index, u8 *feature_type)
+	u8 *feature_index)
 {
 	struct hidpp_report response;
 	int ret;
@@ -918,7 +977,6 @@ static int hidpp_root_get_feature(struct hidpp_device *hidpp, u16 feature,
 		return -ENOENT;
 
 	*feature_index = response.fap.params[0];
-	*feature_type = response.fap.params[1];
 
 	return ret;
 }
@@ -943,7 +1001,8 @@ static int hidpp_root_get_protocol_version(struct hidpp_device *hidpp)
 	}
 
 	/* the device might not be connected */
-	if (ret == HIDPP_ERROR_RESOURCE_ERROR)
+	if (ret == HIDPP_ERROR_RESOURCE_ERROR ||
+	    ret == HIDPP_ERROR_UNKNOWN_DEVICE)
 		return -EIO;
 
 	if (ret > 0) {
@@ -964,8 +1023,13 @@ static int hidpp_root_get_protocol_version(struct hidpp_device *hidpp)
 	hidpp->protocol_minor = response.rap.params[1];
 
 print_version:
-	hid_info(hidpp->hid_dev, "HID++ %u.%u device connected.\n",
-		 hidpp->protocol_major, hidpp->protocol_minor);
+	if (!hidpp->connected_once) {
+		hid_info(hidpp->hid_dev, "HID++ %u.%u device connected.\n",
+			 hidpp->protocol_major, hidpp->protocol_minor);
+		hidpp->connected_once = true;
+	} else
+		hid_dbg(hidpp->hid_dev, "HID++ %u.%u device connected.\n",
+			 hidpp->protocol_major, hidpp->protocol_minor);
 	return 0;
 }
 
@@ -980,13 +1044,11 @@ print_version:
 static int hidpp_get_serial(struct hidpp_device *hidpp, u32 *serial)
 {
 	struct hidpp_report response;
-	u8 feature_type;
 	u8 feature_index;
 	int ret;
 
 	ret = hidpp_root_get_feature(hidpp, HIDPP_PAGE_DEVICE_INFORMATION,
-				     &feature_index,
-				     &feature_type);
+				     &feature_index);
 	if (ret)
 		return ret;
 
@@ -1093,7 +1155,6 @@ static int hidpp_devicenametype_get_device_name(struct hidpp_device *hidpp,
 
 static char *hidpp_get_device_name(struct hidpp_device *hidpp)
 {
-	u8 feature_type;
 	u8 feature_index;
 	u8 __name_length;
 	char *name;
@@ -1101,7 +1162,7 @@ static char *hidpp_get_device_name(struct hidpp_device *hidpp)
 	int ret;
 
 	ret = hidpp_root_get_feature(hidpp, HIDPP_PAGE_GET_DEVICE_NAME_TYPE,
-		&feature_index, &feature_type);
+		&feature_index);
 	if (ret)
 		return NULL;
 
@@ -1268,15 +1329,13 @@ static int hidpp20_batterylevel_get_battery_info(struct hidpp_device *hidpp,
 
 static int hidpp20_query_battery_info_1000(struct hidpp_device *hidpp)
 {
-	u8 feature_type;
 	int ret;
 	int status, capacity, next_capacity, level;
 
 	if (hidpp->battery.feature_index == 0xff) {
 		ret = hidpp_root_get_feature(hidpp,
 					     HIDPP_PAGE_BATTERY_LEVEL_STATUS,
-					     &hidpp->battery.feature_index,
-					     &feature_type);
+					     &hidpp->battery.feature_index);
 		if (ret)
 			return ret;
 	}
@@ -1457,14 +1516,12 @@ static int hidpp20_map_battery_capacity(struct hid_device *hid_dev, int voltage)
 
 static int hidpp20_query_battery_voltage_info(struct hidpp_device *hidpp)
 {
-	u8 feature_type;
 	int ret;
 	int status, voltage, level, charge_type;
 
 	if (hidpp->battery.voltage_feature_index == 0xff) {
 		ret = hidpp_root_get_feature(hidpp, HIDPP_PAGE_BATTERY_VOLTAGE,
-					     &hidpp->battery.voltage_feature_index,
-					     &feature_type);
+					     &hidpp->battery.voltage_feature_index);
 		if (ret)
 			return ret;
 	}
@@ -1660,7 +1717,6 @@ static int hidpp20_unifiedbattery_get_status(struct hidpp_device *hidpp,
 
 static int hidpp20_query_battery_info_1004(struct hidpp_device *hidpp)
 {
-	u8 feature_type;
 	int ret;
 	u8 state_of_charge;
 	int status, level;
@@ -1668,8 +1724,7 @@ static int hidpp20_query_battery_info_1004(struct hidpp_device *hidpp)
 	if (hidpp->battery.feature_index == 0xff) {
 		ret = hidpp_root_get_feature(hidpp,
 					     HIDPP_PAGE_UNIFIED_BATTERY,
-					     &hidpp->battery.feature_index,
-					     &feature_type);
+					     &hidpp->battery.feature_index);
 		if (ret)
 			return ret;
 	}
@@ -1800,17 +1855,11 @@ static int hidpp_battery_get_property(struct power_supply *psy,
 /* -------------------------------------------------------------------------- */
 #define HIDPP_PAGE_WIRELESS_DEVICE_STATUS			0x1d4b
 
-static int hidpp_set_wireless_feature_index(struct hidpp_device *hidpp)
+static int hidpp_get_wireless_feature_index(struct hidpp_device *hidpp, u8 *feature_index)
 {
-	u8 feature_type;
-	int ret;
-
-	ret = hidpp_root_get_feature(hidpp,
-				     HIDPP_PAGE_WIRELESS_DEVICE_STATUS,
-				     &hidpp->wireless_feature_index,
-				     &feature_type);
-
-	return ret;
+	return hidpp_root_get_feature(hidpp,
+				      HIDPP_PAGE_WIRELESS_DEVICE_STATUS,
+				      feature_index);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1921,14 +1970,11 @@ static bool hidpp20_get_adc_measurement_1f20(struct hidpp_device *hidpp,
 
 static int hidpp20_query_adc_measurement_info_1f20(struct hidpp_device *hidpp)
 {
-	u8 feature_type;
-
 	if (hidpp->battery.adc_measurement_feature_index == 0xff) {
 		int ret;
 
 		ret = hidpp_root_get_feature(hidpp, HIDPP_PAGE_ADC_MEASUREMENT,
-					     &hidpp->battery.adc_measurement_feature_index,
-					     &feature_type);
+					     &hidpp->battery.adc_measurement_feature_index);
 		if (ret)
 			return ret;
 
@@ -1983,15 +2029,13 @@ static int hidpp_hrs_set_highres_scrolling_mode(struct hidpp_device *hidpp,
 	bool enabled, u8 *multiplier)
 {
 	u8 feature_index;
-	u8 feature_type;
 	int ret;
 	u8 params[1];
 	struct hidpp_report response;
 
 	ret = hidpp_root_get_feature(hidpp,
 				     HIDPP_PAGE_HI_RESOLUTION_SCROLLING,
-				     &feature_index,
-				     &feature_type);
+				     &feature_index);
 	if (ret)
 		return ret;
 
@@ -2018,12 +2062,11 @@ static int hidpp_hrw_get_wheel_capability(struct hidpp_device *hidpp,
 	u8 *multiplier)
 {
 	u8 feature_index;
-	u8 feature_type;
 	int ret;
 	struct hidpp_report response;
 
 	ret = hidpp_root_get_feature(hidpp, HIDPP_PAGE_HIRES_WHEEL,
-				     &feature_index, &feature_type);
+				     &feature_index);
 	if (ret)
 		goto return_default;
 
@@ -2045,13 +2088,12 @@ static int hidpp_hrw_set_wheel_mode(struct hidpp_device *hidpp, bool invert,
 	bool high_resolution, bool use_hidpp)
 {
 	u8 feature_index;
-	u8 feature_type;
 	int ret;
 	u8 params[1];
 	struct hidpp_report response;
 
 	ret = hidpp_root_get_feature(hidpp, HIDPP_PAGE_HIRES_WHEEL,
-				     &feature_index, &feature_type);
+				     &feature_index);
 	if (ret)
 		return ret;
 
@@ -2080,14 +2122,12 @@ static int hidpp_solar_request_battery_event(struct hidpp_device *hidpp)
 {
 	struct hidpp_report response;
 	u8 params[2] = { 1, 1 };
-	u8 feature_type;
 	int ret;
 
 	if (hidpp->battery.feature_index == 0xff) {
 		ret = hidpp_root_get_feature(hidpp,
 					     HIDPP_PAGE_SOLAR_KEYBOARD,
-					     &hidpp->battery.solar_feature_index,
-					     &feature_type);
+					     &hidpp->battery.solar_feature_index);
 		if (ret)
 			return ret;
 	}
@@ -2491,7 +2531,7 @@ static void hidpp_ff_work_handler(struct work_struct *w)
 			/* regular effect destroyed */
 			data->effect_ids[wd->params[0]-1] = -1;
 		else if (wd->effect_id >= HIDPP_FF_EFFECTID_AUTOCENTER)
-			/* autocenter spring destoyed */
+			/* autocenter spring destroyed */
 			data->slot_autocenter = 0;
 		break;
 	case HIDPP_FF_SET_GLOBAL_GAINS:
@@ -2744,23 +2784,68 @@ static void hidpp_ff_set_gain(struct input_dev *dev, u16 gain)
 static ssize_t hidpp_ff_range_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct hid_device *hid = to_hid_device(dev);
-	struct hid_input *hidinput = list_entry(hid->inputs.next, struct hid_input, list);
-	struct input_dev *idev = hidinput->input;
-	struct hidpp_ff_private_data *data = idev->ff->private;
+	struct hid_input *hidinput;
+	struct input_dev *idev;
+	struct hidpp_ff_private_data *data;
+	struct usb_interface *iface;
 
+	/* Handle cross-interface case: range sysfs is on interface 1, inputs on 0 */
+	if (hid_is_usb(hid)) {
+		iface = to_usb_interface(hid->dev.parent);
+		if (iface->cur_altsetting->desc.bInterfaceNumber != 0) {
+			struct hid_device *hid0;
+			hid0 = usb_get_intfdata(usb_ifnum_to_if(hid_to_usb_dev(hid), 0));
+			if (hid0)
+				hid = hid0;
+		}
+	}
+
+	if (list_empty(&hid->inputs))
+		return -ENODEV;
+
+	hidinput = list_entry(hid->inputs.next, struct hid_input, list);
+	idev = hidinput->input;
+	if (!idev || !idev->ff)
+		return -ENODEV;
+
+	data = idev->ff->private;
 	return scnprintf(buf, PAGE_SIZE, "%u\n", data->range);
 }
 
 static ssize_t hidpp_ff_range_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct hid_device *hid = to_hid_device(dev);
-	struct hid_input *hidinput = list_entry(hid->inputs.next, struct hid_input, list);
-	struct input_dev *idev = hidinput->input;
-	struct hidpp_ff_private_data *data = idev->ff->private;
+	struct hid_input *hidinput;
+	struct input_dev *idev;
+	struct hidpp_ff_private_data *data;
+	struct usb_interface *iface;
 	u8 params[2];
 	int range = simple_strtoul(buf, NULL, 10);
+	__u16 product = hid->product;
 
-	if (hid->product == USB_DEVICE_ID_LOGITECH_G_PRO_XBOX_WHEEL)
+	/* Handle cross-interface case: range sysfs is on interface 1, inputs on 0 */
+	if (hid_is_usb(hid)) {
+		iface = to_usb_interface(hid->dev.parent);
+		if (iface->cur_altsetting->desc.bInterfaceNumber != 0) {
+			struct hid_device *hid0;
+			hid0 = usb_get_intfdata(usb_ifnum_to_if(hid_to_usb_dev(hid), 0));
+			if (hid0)
+				hid = hid0;
+		}
+	}
+
+	if (list_empty(&hid->inputs))
+		return -ENODEV;
+
+	hidinput = list_entry(hid->inputs.next, struct hid_input, list);
+	idev = hidinput->input;
+	if (!idev || !idev->ff)
+		return -ENODEV;
+
+	data = idev->ff->private;
+
+	/* Direct-drive wheels (RS50) support up to 1080 degrees rotation */
+	if (product == USB_DEVICE_ID_LOGITECH_RS50)
 		range = clamp(range, 180, 1080);
 	else
 		range = clamp(range, 180, 900);
@@ -2793,26 +2878,33 @@ static int hidpp_ff_init(struct hidpp_device *hidpp,
 	struct hid_device *hid = hidpp->hid_dev;
 	struct hid_input *hidinput;
 	struct input_dev *dev;
-	struct usb_interface *iface;
 	struct usb_device_descriptor *udesc;
 	u16 bcdDevice;
 	struct ff_device *ff;
 	int error, j, num_slots = data->num_effects;
 	u8 version;
+	struct usb_interface *iface;
 
 	if (!hid_is_usb(hid)) {
 		hid_err(hid, "device is not USB\n");
 		return -ENODEV;
 	}
 
-	//   Try to find inputs on boot interface if we have ffb initialization
-	// not on the first interface (G Pro Wheel for example)
+	/*
+	 * Direct-drive wheels (RS50, G Pro) have HID++ on interface 1 but
+	 * input on interface 0. If we're on a non-zero interface, get the
+	 * hid_device from interface 0 to find the input device.
+	 */
 	iface = to_usb_interface(hid->dev.parent);
-	if (hidpp->quirks & HIDPP_QUIRK_CLASS_G920 && 
-		iface->cur_altsetting->desc.bInterfaceNumber != 0)
-		hid = usb_get_intfdata(usb_ifnum_to_if(hid_to_usb_dev(hid), 0));
+	if ((hidpp->quirks & HIDPP_QUIRK_CLASS_G920) &&
+	    iface->cur_altsetting->desc.bInterfaceNumber != 0) {
+		struct hid_device *hid_iface0;
+		hid_iface0 = usb_get_intfdata(usb_ifnum_to_if(hid_to_usb_dev(hid), 0));
+		if (hid_iface0)
+			hid = hid_iface0;
+	}
 
-	if (list_empty(&hid->inputs)) {
+	if (!hid || list_empty(&hid->inputs)) {
 		hid_err(hid, "no inputs found\n");
 		return -ENODEV;
 	}
@@ -3078,11 +3170,10 @@ static int wtp_get_config(struct hidpp_device *hidpp)
 {
 	struct wtp_data *wd = hidpp->private_data;
 	struct hidpp_touchpad_raw_info raw_info = {0};
-	u8 feature_type;
 	int ret;
 
 	ret = hidpp_root_get_feature(hidpp, HIDPP_PAGE_TOUCHPAD_RAW_XY,
-		&wd->mt_feature_index, &feature_type);
+		&wd->mt_feature_index);
 	if (ret)
 		/* means that the device is not powered up */
 		return ret;
@@ -3118,7 +3209,7 @@ static int wtp_allocate(struct hid_device *hdev, const struct hid_device_id *id)
 	return 0;
 };
 
-static int wtp_connect(struct hid_device *hdev, bool connected)
+static int wtp_connect(struct hid_device *hdev)
 {
 	struct hidpp_device *hidpp = hid_get_drvdata(hdev);
 	struct wtp_data *wd = hidpp->private_data;
@@ -3180,7 +3271,7 @@ static const u8 m560_config_parameter[] = {0x00, 0xaf, 0x03};
 #define M560_SUB_ID			0x0a
 #define M560_BUTTON_MODE_REGISTER	0x35
 
-static int m560_send_config_command(struct hid_device *hdev, bool connected)
+static int m560_send_config_command(struct hid_device *hdev)
 {
 	struct hidpp_report response;
 	struct hidpp_device *hidpp_dev;
@@ -3276,13 +3367,13 @@ static int m560_raw_event(struct hid_device *hdev, u8 *data, int size)
 					 120);
 		}
 
-		v = hid_snto32(hid_field_extract(hdev, data+3, 0, 12), 12);
+		v = sign_extend32(hid_field_extract(hdev, data + 3, 0, 12), 11);
 		input_report_rel(hidpp->input, REL_X, v);
 
-		v = hid_snto32(hid_field_extract(hdev, data+3, 12, 12), 12);
+		v = sign_extend32(hid_field_extract(hdev, data + 3, 12, 12), 11);
 		input_report_rel(hidpp->input, REL_Y, v);
 
-		v = hid_snto32(data[6], 8);
+		v = sign_extend32(data[6], 7);
 		if (v != 0)
 			hidpp_scroll_counter_handle_scroll(hidpp->input,
 					&hidpp->vertical_wheel_counter, v);
@@ -3342,12 +3433,11 @@ static int k400_disable_tap_to_click(struct hidpp_device *hidpp)
 	struct k400_private_data *k400 = hidpp->private_data;
 	struct hidpp_touchpad_fw_items items = {};
 	int ret;
-	u8 feature_type;
 
 	if (!k400->feature_index) {
 		ret = hidpp_root_get_feature(hidpp,
 			HIDPP_PAGE_TOUCHPAD_FW_ITEMS,
-			&k400->feature_index, &feature_type);
+			&k400->feature_index);
 		if (ret)
 			/* means that the device is not powered up */
 			return ret;
@@ -3375,7 +3465,7 @@ static int k400_allocate(struct hid_device *hdev)
 	return 0;
 };
 
-static int k400_connect(struct hid_device *hdev, bool connected)
+static int k400_connect(struct hid_device *hdev)
 {
 	struct hidpp_device *hidpp = hid_get_drvdata(hdev);
 
@@ -3419,15 +3509,13 @@ static int g920_get_config(struct hidpp_device *hidpp,
 			   struct hidpp_ff_private_data *data)
 {
 	struct hidpp_report response;
-	u8 feature_type;
 	int ret;
-	int max_angle;
 
 	memset(data, 0, sizeof(*data));
 
 	/* Find feature and store for later use */
 	ret = hidpp_root_get_feature(hidpp, HIDPP_PAGE_G920_FORCE_FEEDBACK,
-				     &data->feature_index, &feature_type);
+				     &data->feature_index);
 	if (ret)
 		return ret;
 
@@ -3462,13 +3550,15 @@ static int g920_get_config(struct hidpp_device *hidpp,
 		hid_warn(hidpp->hid_dev,
 			 "Failed to read range from device!\n");
 	}
-	if (hidpp->hid_dev->product == USB_DEVICE_ID_LOGITECH_G_PRO_XBOX_WHEEL)
-		max_angle = 1080;
-	else
-		max_angle = 900;
-
-	data->range = ret ?
-		max_angle : get_unaligned_be16(&response.fap.params[0]);
+	/* Direct-drive wheels default to 1080, belt-driven to 900 */
+	if (ret) {
+		if (hidpp->hid_dev->product == USB_DEVICE_ID_LOGITECH_RS50)
+			data->range = 1080;
+		else
+			data->range = 900;
+	} else {
+		data->range = get_unaligned_be16(&response.fap.params[0]);
+	}
 
 	/* Read the current gain values */
 	ret = hidpp_send_fap_command_sync(hidpp, data->feature_index,
@@ -3484,6 +3574,2368 @@ static int g920_get_config(struct hidpp_device *hidpp,
 	/* ignore boost value at response.fap.params[2] */
 
 	return g920_ff_set_autocenter(hidpp, data);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Logitech RS50 Direct Drive Racing Wheel                                    */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * The RS50 uses a completely different FFB architecture than G920/G923.
+ * Instead of HID++ feature 0x8123, it uses dedicated endpoint 0x03 OUT
+ * with raw 64-byte output reports for real-time force feedback.
+ *
+ * FFB commands are sent via a workqueue to avoid blocking in callback context.
+ */
+
+#define RS50_FF_REPORT_ID		0x01
+#define RS50_FF_EFFECT_CONSTANT		0x01
+#define RS50_FF_REPORT_SIZE		64
+#define RS50_INPUT_REPORT_SIZE		30	/* Interface 0 joystick report */
+
+/* RS50 D-pad encoding in byte 0 of joystick report */
+#define RS50_DPAD_RELEASED		0x08	/* Bit set when D-pad not pressed */
+#define RS50_DPAD_DIR_MASK		0x07	/* Direction bits 0-2 */
+#define RS50_DPAD_RIGHT			0x00
+#define RS50_DPAD_UP_RIGHT		0x01
+#define RS50_DPAD_LEFT			0x02
+#define RS50_DPAD_UP_LEFT		0x03
+#define RS50_DPAD_UP			0x04
+#define RS50_DPAD_DOWN_RIGHT		0x05
+#define RS50_DPAD_DOWN			0x06
+#define RS50_DPAD_DOWN_LEFT		0x07
+
+/* RS50 FFB refresh command (sent periodically to maintain FFB state) */
+#define RS50_FF_REFRESH_ID		0x05
+#define RS50_FF_REFRESH_CMD		0x07
+#define RS50_FF_REFRESH_INTERVAL_MS	20000	/* 20 seconds */
+
+/*
+ * RS50 HID++ feature PAGE IDs for wheel settings.
+ * These are used with hidpp_root_get_feature() to discover the actual
+ * feature indices, which vary per device. Never use hardcoded indices!
+ */
+#define RS50_PAGE_BRIGHTNESS	0x8040	/* LED Brightness Control */
+#define RS50_PAGE_LIGHTSYNC	0x807A	/* LIGHTSYNC LED Effects */
+#define RS50_PAGE_DAMPING	0x8133	/* Wheel Damping */
+#define RS50_PAGE_BRAKEFORCE	0x8134	/* Brake Force Threshold */
+#define RS50_PAGE_STRENGTH	0x8136	/* FFB Strength */
+#define RS50_PAGE_RANGE		0x8138	/* Rotation Range */
+#define RS50_PAGE_TRUEFORCE	0x8139	/* TRUEFORCE Bass Shaker */
+#define RS50_PAGE_FILTER	0x8140	/* FFB Filter */
+
+/*
+ * RS50 HID descriptor declares buttons 1-92 but only ~20 are physically present.
+ * Buttons >= 81 (0x51) overflow past valid Linux input codes (max 767), causing
+ * "Invalid code" kernel messages. We ignore these phantom buttons during input
+ * mapping.
+ */
+#define RS50_MAX_BUTTON_USAGE	0x50	/* Accept buttons 1-80, ignore 81+ */
+
+/* RS50 HID++ function IDs for settings */
+#define RS50_HIDPP_FN_GET		0x00	/* Function 0 << 4 = get value */
+#define RS50_HIDPP_FN_SET		0x10	/* Function 1 << 4 = set value */
+#define RS50_HIDPP_FN_SET_ALT		0x20	/* Function 2 << 4 (alternate) */
+
+/* Marker for features that weren't discovered (not supported by device) */
+#define RS50_FEATURE_NOT_FOUND		0xFF
+
+/*
+ * RS50 condition effects support.
+ * Unlike ff-memless which only supports FF_CONSTANT, we implement
+ * FF_SPRING, FF_DAMPER, FF_FRICTION, and FF_INERTIA ourselves.
+ */
+#define RS50_FF_MAX_EFFECTS		16	/* Max simultaneous effects */
+#define RS50_FF_TIMER_INTERVAL_MS	4	/* ~250 Hz update rate */
+
+/*
+ * RS50 pedal response curve types.
+ * These curves are applied in software to pedal axis values.
+ */
+#define RS50_CURVE_LINEAR		0	/* 1:1 linear mapping */
+#define RS50_CURVE_LOW_SENS		1	/* Less sensitive at start */
+#define RS50_CURVE_HIGH_SENS		2	/* More sensitive at start */
+
+/* Effect state tracking */
+struct rs50_ff_effect {
+	struct ff_effect effect;
+	bool uploaded;
+	bool playing;
+};
+
+/* Position history for velocity/acceleration calculation */
+#define RS50_FF_POS_HISTORY_SIZE	4
+struct rs50_ff_position_history {
+	s32 position[RS50_FF_POS_HISTORY_SIZE];
+	unsigned long timestamp[RS50_FF_POS_HISTORY_SIZE];
+	int index;
+};
+
+/* RS50 FFB output report structure (64 bytes to endpoint 0x03) */
+struct rs50_ff_report {
+	u8 report_id;		/* 0x01 */
+	u8 reserved[3];		/* 0x00, 0x00, 0x00 */
+	u8 effect_type;		/* 0x01 = constant force */
+	u8 sequence;		/* incrementing counter (single byte, wraps at 255) */
+	__le16 force;		/* 0x0000=left, 0x8000=center, 0xFFFF=right */
+	__le16 force_dup;	/* duplicate of force value */
+	u8 padding[54];		/* zeros */
+} __packed;
+
+static_assert(sizeof(struct rs50_ff_report) == RS50_FF_REPORT_SIZE,
+	      "RS50 FFB report structure size mismatch");
+
+/* RS50 FFB work item for async USB transfers */
+struct rs50_ff_work {
+	struct work_struct work;
+	struct rs50_ff_data *ff_data;
+	u16 force;
+	/*
+	 * Per-work DMA-safe buffer for USB transfer.
+	 * This avoids race conditions where hid_hw_output_report() returns
+	 * before the USB transfer completes, and another work item could
+	 * overwrite a shared buffer while it's still being DMA'd.
+	 */
+	u8 report_buf[RS50_FF_REPORT_SIZE];
+};
+
+/* RS50 FFB private data */
+struct rs50_ff_data {
+	struct hidpp_device *hidpp;
+	struct hid_device *ff_hdev;	/* hid_device for interface 2 (FFB) */
+	struct input_dev *input;
+	struct workqueue_struct *wq;	/* Workqueue for async USB transfers */
+	struct delayed_work init_work;	/* Deferred initialization */
+	struct delayed_work refresh_work; /* Periodic FFB refresh (05 07 cmd) */
+	struct timer_list effect_timer;	/* Timer for condition effects */
+	atomic_t sequence;
+	atomic_t pending_work;		/* Number of pending work items */
+	atomic_t stopping;		/* Set when driver is shutting down */
+	atomic_t initialized;		/* FFB fully initialized */
+	unsigned long last_err_log;	/* Timestamp of last error log */
+	int err_count;			/* Error count for throttling */
+
+	/*
+	 * HID++ feature indices - discovered via hidpp_root_get_feature().
+	 * Set to RS50_FEATURE_NOT_FOUND (0xFF) if feature not supported.
+	 */
+	u8 idx_range;			/* Feature index for rotation range */
+	u8 idx_strength;		/* Feature index for FFB strength */
+	u8 idx_damping;			/* Feature index for damping */
+	u8 idx_trueforce;		/* Feature index for TRUEFORCE */
+	u8 idx_brakeforce;		/* Feature index for brake force */
+	u8 idx_filter;			/* Feature index for FFB filter */
+	u8 idx_brightness;		/* Feature index for LED brightness */
+	u8 idx_lightsync;		/* Feature index for LIGHTSYNC */
+
+	/* Wheel settings (sysfs configurable) */
+	u16 range;			/* rotation range in degrees */
+	u16 strength;			/* FFB strength (0-65535) */
+	u16 damping;			/* damping level (0-65535) */
+	u16 trueforce;			/* TRUEFORCE level (0-65535) */
+	u16 brake_force;		/* Brake Force threshold (0-65535) */
+	u8 ffb_filter;			/* FFB filter level (1-15) */
+	u8 ffb_filter_auto;		/* Auto FFB filter (0=off, 1=on) */
+	u8 led_effect;			/* LIGHTSYNC effect (1-5) */
+	u8 led_brightness;		/* LED brightness (0-100) */
+
+	/* Oversteer compatibility - stored locally, no hardware effect */
+	u8 autocenter;			/* Autocenter strength 0-100 (stub) */
+
+	/* Pedal response curve and combined mode settings */
+	u8 combined_pedals;		/* 0=off, 1=on (throttle - brake) */
+	u8 throttle_curve;		/* RS50_CURVE_* type */
+	u8 brake_curve;			/* RS50_CURVE_* type */
+	u8 clutch_curve;		/* RS50_CURVE_* type */
+	u8 throttle_deadzone_lower;	/* Lower deadzone 0-100% */
+	u8 throttle_deadzone_upper;	/* Upper deadzone 0-100% */
+	u8 brake_deadzone_lower;	/* Lower deadzone 0-100% */
+	u8 brake_deadzone_upper;	/* Upper deadzone 0-100% */
+	u8 clutch_deadzone_lower;	/* Lower deadzone 0-100% */
+	u8 clutch_deadzone_upper;	/* Upper deadzone 0-100% */
+
+	/* Condition effects support */
+	struct rs50_ff_effect effects[RS50_FF_MAX_EFFECTS];
+	spinlock_t effects_lock;	/* Protects effects array */
+	struct rs50_ff_position_history pos_history;
+	s32 last_force;			/* Last force sent (for smoothing) */
+	s32 constant_force;		/* Current constant force from games */
+
+	/* D-pad state tracking (per-device, not static) */
+	int last_dpad_x;
+	int last_dpad_y;
+
+	/* Track whether we opened HID device for runtime HID++ communication */
+	bool hid_open;
+};
+
+/* Maximum pending work items to prevent memory exhaustion */
+#define RS50_FF_MAX_PENDING_WORK	8
+
+/* Delay before deferred FFB initialization (ms) */
+#define RS50_FF_INIT_DELAY_MS		1000
+
+/* Forward declarations */
+static void rs50_ff_work_handler(struct work_struct *work);
+static void rs50_ff_send_force(struct rs50_ff_data *ff, s32 force);
+static void rs50_ff_effect_timer_callback(struct timer_list *t);
+static void rs50_setup_dpad(struct input_dev *input);
+static int rs50_process_dpad(struct hidpp_device *hidpp, u8 *data, int size);
+static void rs50_process_pedals(struct hidpp_device *hidpp, u8 *data, int size);
+
+/*
+ * Update position history for velocity/acceleration calculation.
+ * Call this each time wheel position is read.
+ */
+static void rs50_ff_update_position(struct rs50_ff_data *ff, s32 position)
+{
+	struct rs50_ff_position_history *h = &ff->pos_history;
+
+	h->index = (h->index + 1) % RS50_FF_POS_HISTORY_SIZE;
+	h->position[h->index] = position;
+	h->timestamp[h->index] = jiffies;
+}
+
+/*
+ * Calculate wheel velocity (position change per time unit).
+ * Returns velocity in units per second, scaled by 1000 for precision.
+ */
+static s32 rs50_ff_get_velocity(struct rs50_ff_data *ff)
+{
+	struct rs50_ff_position_history *h = &ff->pos_history;
+	int curr = h->index;
+	int prev = (curr + RS50_FF_POS_HISTORY_SIZE - 1) % RS50_FF_POS_HISTORY_SIZE;
+	unsigned long dt_jiffies;
+	s32 dp;
+
+	dt_jiffies = h->timestamp[curr] - h->timestamp[prev];
+	if (dt_jiffies == 0)
+		return 0;
+
+	dp = h->position[curr] - h->position[prev];
+	/*
+	 * Scale: convert to per-second, multiply by 1000 for precision.
+	 * Use s64 to prevent overflow: dp * 1000 * 1000 can exceed s32 limits.
+	 * Keep dt_jiffies as unsigned long to avoid wraparound on 64-bit systems.
+	 */
+	return (s32)(((s64)dp * HZ * 1000) / (s64)dt_jiffies);
+}
+
+/*
+ * Calculate wheel acceleration (velocity change per time unit).
+ * Returns acceleration in units per second squared, scaled.
+ */
+static s32 rs50_ff_get_acceleration(struct rs50_ff_data *ff)
+{
+	struct rs50_ff_position_history *h = &ff->pos_history;
+	int i0 = h->index;
+	int i1 = (i0 + RS50_FF_POS_HISTORY_SIZE - 1) % RS50_FF_POS_HISTORY_SIZE;
+	int i2 = (i0 + RS50_FF_POS_HISTORY_SIZE - 2) % RS50_FF_POS_HISTORY_SIZE;
+	unsigned long dt1, dt2;
+	s32 v1, v2;
+
+	dt1 = h->timestamp[i0] - h->timestamp[i1];
+	dt2 = h->timestamp[i1] - h->timestamp[i2];
+	if (dt1 == 0 || dt2 == 0)
+		return 0;
+
+	v1 = (h->position[i0] - h->position[i1]) * HZ / (s32)dt1;
+	v2 = (h->position[i1] - h->position[i2]) * HZ / (s32)dt2;
+
+	return (v1 - v2) * HZ / (s32)dt1;
+}
+
+/*
+ * Calculate force for a single condition effect.
+ * Position is normalized: 0x0000 = full left, 0x8000 = center, 0xFFFF = full right
+ */
+static s32 rs50_ff_calc_condition_force(struct rs50_ff_data *ff,
+					struct ff_effect *effect,
+					s32 position, s32 velocity, s32 accel)
+{
+	struct ff_condition_effect *cond;
+	s32 metric, force;
+	s32 center, deadband;
+	s16 left_coeff, right_coeff;
+	s16 left_sat, right_sat;
+
+	/* Condition effects have parameters for each axis, we use axis 0 (X) for steering */
+	cond = &effect->u.condition[0];
+
+	center = cond->center;
+	deadband = cond->deadband;
+	left_coeff = cond->left_coeff;
+	right_coeff = cond->right_coeff;
+	left_sat = cond->left_saturation;
+	right_sat = cond->right_saturation;
+
+	/* Determine the metric based on effect type */
+	switch (effect->type) {
+	case FF_SPRING:
+		/* Spring: force based on displacement from center */
+		metric = position - center;
+		break;
+	case FF_DAMPER:
+		/* Damper: force based on velocity (resists movement) */
+		metric = velocity / 100; /* Scale down velocity */
+		break;
+	case FF_FRICTION:
+		/* Friction: constant force opposing movement direction */
+		if (velocity > 100)
+			metric = 0x4000; /* Arbitrary positive value */
+		else if (velocity < -100)
+			metric = -0x4000;
+		else
+			metric = 0; /* In deadband */
+		break;
+	case FF_INERTIA:
+		/* Inertia: force based on acceleration (resists speed changes) */
+		metric = accel / 10;
+		break;
+	default:
+		return 0;
+	}
+
+	/* Apply deadband */
+	if (abs(metric) < deadband)
+		return 0;
+
+	/* Calculate force based on direction from center/zero */
+	if (metric > 0) {
+		/* Positive direction: use right coefficient */
+		metric -= deadband;
+		force = (metric * right_coeff) >> 15;
+		/* Apply saturation */
+		if (right_sat && force > right_sat)
+			force = right_sat;
+	} else {
+		/* Negative direction: use left coefficient */
+		metric += deadband;
+		force = (metric * left_coeff) >> 15;
+		/* Apply saturation (note: left_sat is positive, force is negative) */
+		if (left_sat && force < -left_sat)
+			force = -left_sat;
+	}
+
+	return force;
+}
+
+/*
+ * Sum all active condition effects and return total force.
+ * Also includes any constant force effect.
+ */
+static s32 rs50_ff_calculate_total_force(struct rs50_ff_data *ff, s32 position)
+{
+	s32 total_force = 0;
+	s32 velocity, accel;
+	int i;
+	unsigned long flags;
+
+	velocity = rs50_ff_get_velocity(ff);
+	accel = rs50_ff_get_acceleration(ff);
+
+	spin_lock_irqsave(&ff->effects_lock, flags);
+
+	/* Add constant force from games */
+	total_force = ff->constant_force;
+
+	/* Sum all active condition effects */
+	for (i = 0; i < RS50_FF_MAX_EFFECTS; i++) {
+		struct rs50_ff_effect *eff = &ff->effects[i];
+
+		if (!eff->uploaded || !eff->playing)
+			continue;
+
+		switch (eff->effect.type) {
+		case FF_SPRING:
+		case FF_DAMPER:
+		case FF_FRICTION:
+		case FF_INERTIA:
+			total_force += rs50_ff_calc_condition_force(ff, &eff->effect,
+								    position, velocity, accel);
+			break;
+		case FF_CONSTANT:
+			/* Handled via constant_force field */
+			break;
+		default:
+			break;
+		}
+	}
+
+	spin_unlock_irqrestore(&ff->effects_lock, flags);
+
+	/* Clamp to valid range */
+	total_force = clamp(total_force, -0x7FFF, 0x7FFF);
+
+	return total_force;
+}
+
+/*
+ * Timer callback - runs at ~250Hz to update condition effects.
+ * Reads wheel position, calculates forces, and sends to device.
+ */
+static void rs50_ff_effect_timer_callback(struct timer_list *t)
+{
+	struct rs50_ff_data *ff = container_of(t, struct rs50_ff_data, effect_timer);
+	struct input_dev *input;
+	s32 position, force;
+
+	if (!ff || atomic_read_acquire(&ff->stopping) || !atomic_read(&ff->initialized))
+		return;
+
+	/*
+	 * Get a local copy of the input pointer using READ_ONCE.
+	 * This protects against the input device being freed between
+	 * the NULL check and the dereference. If input becomes NULL
+	 * during destroy, we'll see it and exit safely.
+	 */
+	input = READ_ONCE(ff->input);
+	if (!input)
+		return;
+
+	/*
+	 * Verify the input device has ABS_X capability and absinfo is valid.
+	 * Without this check, accessing absinfo[ABS_X] can cause a crash
+	 * if the device doesn't have absolute axis support configured.
+	 */
+	if (!input->absinfo || !test_bit(ABS_X, input->absbit)) {
+		/* No ABS_X support - don't reschedule timer */
+		return;
+	}
+
+	/* Read current wheel position from input device */
+	position = input->absinfo[ABS_X].value;
+
+	/* Normalize: input is 0x0000-0xFFFF, convert to signed for calculations */
+	/* Center (0x8000) becomes 0, left (0x0000) becomes -0x8000, right (0xFFFF) becomes +0x7FFF */
+	position = position - 0x8000;
+
+	/* Update position history */
+	rs50_ff_update_position(ff, position);
+
+	/* Calculate total force from all active effects */
+	force = rs50_ff_calculate_total_force(ff, position);
+
+	/* Only send if force changed significantly (reduces USB traffic) */
+	if (abs(force - ff->last_force) > 64) {
+		rs50_ff_send_force(ff, force);
+		ff->last_force = force;
+	}
+
+	/* Reschedule timer if still running */
+	if (!atomic_read_acquire(&ff->stopping) && atomic_read(&ff->initialized))
+		mod_timer(&ff->effect_timer,
+			  jiffies + msecs_to_jiffies(RS50_FF_TIMER_INTERVAL_MS));
+}
+
+/*
+ * Send a force value to the wheel (non-blocking, queues work).
+ */
+static void rs50_ff_send_force(struct rs50_ff_data *ff, s32 force)
+{
+	struct rs50_ff_work *ff_work;
+	int pending;
+
+	if (!ff || atomic_read_acquire(&ff->stopping) || !atomic_read(&ff->initialized))
+		return;
+
+	pending = atomic_read(&ff->pending_work);
+	if (pending >= RS50_FF_MAX_PENDING_WORK)
+		return;
+
+	ff_work = kmalloc(sizeof(*ff_work), GFP_ATOMIC);
+	if (!ff_work)
+		return;
+
+	/* Convert from signed to offset binary */
+	ff_work->force = (s16)force + 0x8000;
+	ff_work->ff_data = ff;
+	INIT_WORK(&ff_work->work, rs50_ff_work_handler);
+
+	atomic_inc(&ff->pending_work);
+	queue_work(ff->wq, &ff_work->work);
+}
+
+/*
+ * FF effect upload callback - stores effect for later playback.
+ */
+static int rs50_ff_upload(struct input_dev *dev, struct ff_effect *effect,
+			  struct ff_effect *old)
+{
+	struct rs50_ff_data *ff = dev->ff->private;
+	int id = effect->id;
+	unsigned long flags;
+
+	if (!ff || id < 0 || id >= RS50_FF_MAX_EFFECTS)
+		return -EINVAL;
+
+	spin_lock_irqsave(&ff->effects_lock, flags);
+	ff->effects[id].effect = *effect;
+	ff->effects[id].uploaded = true;
+	/* Keep playing state if updating an existing effect */
+	if (!old)
+		ff->effects[id].playing = false;
+	spin_unlock_irqrestore(&ff->effects_lock, flags);
+
+	pr_debug("rs50_ff: uploaded effect %d type=%d\n", id, effect->type);
+	return 0;
+}
+
+/*
+ * FF effect erase callback - removes effect.
+ */
+static int rs50_ff_erase(struct input_dev *dev, int id)
+{
+	struct rs50_ff_data *ff = dev->ff->private;
+	unsigned long flags;
+
+	if (!ff || id < 0 || id >= RS50_FF_MAX_EFFECTS)
+		return -EINVAL;
+
+	spin_lock_irqsave(&ff->effects_lock, flags);
+	ff->effects[id].uploaded = false;
+	ff->effects[id].playing = false;
+	memset(&ff->effects[id].effect, 0, sizeof(struct ff_effect));
+	spin_unlock_irqrestore(&ff->effects_lock, flags);
+
+	pr_debug("rs50_ff: erased effect %d\n", id);
+	return 0;
+}
+
+/*
+ * FF playback callback - starts or stops an effect.
+ */
+static int rs50_ff_playback(struct input_dev *dev, int id, int value)
+{
+	struct rs50_ff_data *ff = dev->ff->private;
+	unsigned long flags;
+
+	if (!ff || id < 0 || id >= RS50_FF_MAX_EFFECTS)
+		return -EINVAL;
+
+	spin_lock_irqsave(&ff->effects_lock, flags);
+
+	if (!ff->effects[id].uploaded) {
+		spin_unlock_irqrestore(&ff->effects_lock, flags);
+		return -EINVAL;
+	}
+
+	ff->effects[id].playing = (value != 0);
+
+	/* For constant effects, update the constant_force field */
+	if (ff->effects[id].effect.type == FF_CONSTANT) {
+		if (value) {
+			s32 level = ff->effects[id].effect.u.constant.level;
+			/* Apply direction */
+			level = (level * fixp_sin16((ff->effects[id].effect.direction * 360) >> 16)) >> 15;
+			ff->constant_force = level;
+		} else {
+			/* Check if any other constant effects are playing */
+			int i;
+
+			ff->constant_force = 0;
+			for (i = 0; i < RS50_FF_MAX_EFFECTS; i++) {
+				if (i != id && ff->effects[i].uploaded &&
+				    ff->effects[i].playing &&
+				    ff->effects[i].effect.type == FF_CONSTANT) {
+					s32 level = ff->effects[i].effect.u.constant.level;
+					level = (level * fixp_sin16((ff->effects[i].effect.direction * 360) >> 16)) >> 15;
+					ff->constant_force += level;
+				}
+			}
+		}
+	}
+
+	spin_unlock_irqrestore(&ff->effects_lock, flags);
+
+	pr_debug("rs50_ff: playback effect %d value=%d\n", id, value);
+	return 0;
+}
+
+/*
+ * Set FF gain (global force multiplier).
+ */
+static void rs50_ff_set_gain(struct input_dev *dev, u16 gain)
+{
+	/* Gain is handled by the wheel's strength setting via sysfs */
+	pr_debug("rs50_ff: set_gain %d (handled by strength sysfs)\n", gain);
+}
+
+/* Work handler - runs in workqueue context where blocking calls are safe */
+static void rs50_ff_work_handler(struct work_struct *work)
+{
+	struct rs50_ff_work *ff_work = container_of(work, struct rs50_ff_work, work);
+	struct rs50_ff_data *ff = ff_work->ff_data;
+	struct rs50_ff_report *report;
+	int ret;
+
+	/* Safety check: abort if driver is shutting down or data is invalid */
+	if (!ff) {
+		kfree(ff_work);
+		return;
+	}
+	if (atomic_read_acquire(&ff->stopping)) {
+		atomic_dec(&ff->pending_work);
+		kfree(ff_work);
+		return;
+	}
+
+	/* Validate ff_hdev is still valid */
+	if (!ff->ff_hdev) {
+		atomic_dec(&ff->pending_work);
+		kfree(ff_work);
+		return;
+	}
+
+	/*
+	 * Use the per-work buffer to avoid race conditions where
+	 * hid_hw_output_report() returns before DMA completes.
+	 */
+	report = (struct rs50_ff_report *)ff_work->report_buf;
+	memset(report, 0, RS50_FF_REPORT_SIZE);
+	report->report_id = RS50_FF_REPORT_ID;
+	report->effect_type = RS50_FF_EFFECT_CONSTANT;
+	report->sequence = atomic_inc_return(&ff->sequence) & 0xFF;
+	report->force = cpu_to_le16(ff_work->force);
+	report->force_dup = report->force;
+
+	/*
+	 * Send FFB via interface 2's HID output report mechanism.
+	 * Try hid_hw_output_report first (uses interrupt OUT if available),
+	 * fall back to hid_hw_raw_request (uses SET_REPORT control transfer).
+	 * This mirrors what hidraw does in hidraw_write().
+	 */
+	ret = hid_hw_output_report(ff->ff_hdev, ff_work->report_buf, RS50_FF_REPORT_SIZE);
+	if (ret == -ENOSYS) {
+		/* No output_report method, try raw_request instead */
+		ret = hid_hw_raw_request(ff->ff_hdev, RS50_FF_REPORT_ID,
+					 ff_work->report_buf, RS50_FF_REPORT_SIZE,
+					 HID_OUTPUT_REPORT, HID_REQ_SET_REPORT);
+	}
+
+	if (ret < 0) {
+		/* Throttle error logging to avoid flooding dmesg (per-instance) */
+		if (time_after(jiffies, ff->last_err_log + HZ) || ff->err_count < 5) {
+			hid_err(ff->ff_hdev, "RS50 FFB send failed: %d\n", ret);
+			ff->last_err_log = jiffies;
+			ff->err_count++;
+		}
+	}
+
+	/*
+	 * Decrement pending work counter AFTER all ff field accesses.
+	 * This prevents use-after-free if destroy() runs between the
+	 * decrement and subsequent ff access.
+	 */
+	atomic_dec(&ff->pending_work);
+	kfree(ff_work);
+}
+
+/*
+ * Periodic FFB refresh handler - sends the 05 07 command to maintain FFB state.
+ * G Hub sends this approximately every 20-30 seconds during gameplay.
+ */
+static void rs50_ff_refresh_work(struct work_struct *work)
+{
+	struct rs50_ff_data *ff = container_of(work, struct rs50_ff_data,
+					       refresh_work.work);
+	u8 *refresh_cmd;
+	int ret;
+
+	/* Abort if shutting down or not initialized */
+	if (!ff || atomic_read_acquire(&ff->stopping) || !atomic_read(&ff->initialized))
+		return;
+
+	if (!ff->ff_hdev)
+		return;
+
+	/*
+	 * Allocate DMA-safe buffer for USB transfer.
+	 * Stack buffers are NOT DMA-safe on many architectures (ARM, VMAP_STACK).
+	 */
+	refresh_cmd = kzalloc(RS50_FF_REPORT_SIZE, GFP_KERNEL);
+	if (!refresh_cmd)
+		return;
+
+	/* Build the 05 07 refresh command */
+	refresh_cmd[0] = RS50_FF_REFRESH_ID;	/* 0x05 */
+	refresh_cmd[1] = RS50_FF_REFRESH_CMD;	/* 0x07 */
+	refresh_cmd[7] = 0xFF;
+	refresh_cmd[8] = 0xFF;
+
+	/* Send the refresh command */
+	ret = hid_hw_output_report(ff->ff_hdev, refresh_cmd, RS50_FF_REPORT_SIZE);
+	if (ret == -ENOSYS) {
+		ret = hid_hw_raw_request(ff->ff_hdev, RS50_FF_REFRESH_ID,
+					 refresh_cmd, RS50_FF_REPORT_SIZE,
+					 HID_OUTPUT_REPORT, HID_REQ_SET_REPORT);
+	}
+
+	kfree(refresh_cmd);
+
+	if (ret < 0) {
+		/* Only log occasional errors to avoid flooding */
+		if (time_after(jiffies, ff->last_err_log + HZ * 60)) {
+			hid_warn(ff->ff_hdev, "RS50 FFB refresh failed: %d\n", ret);
+			ff->last_err_log = jiffies;
+		}
+	}
+
+	/* Reschedule if still running - use dedicated workqueue for consistency */
+	if (!atomic_read_acquire(&ff->stopping) && atomic_read(&ff->initialized)) {
+		queue_delayed_work(ff->wq, &ff->refresh_work,
+				   msecs_to_jiffies(RS50_FF_REFRESH_INTERVAL_MS));
+	}
+}
+
+/* Forward declaration */
+static void rs50_ff_init_work(struct work_struct *work);
+
+/*
+ * Query current device settings via HID++ and update our cached values.
+ * Called during init to sync with actual device state.
+ */
+/*
+ * Discover HID++ feature indices for RS50 wheel settings.
+ * This queries the root feature (index 0) to find where each
+ * feature is located in this device's feature table.
+ */
+static void rs50_ff_discover_features(struct rs50_ff_data *ff)
+{
+	struct hidpp_device *hidpp = ff->hidpp;
+	int ret;
+
+	pr_debug("rs50_ff: discovering HID++ features\n");
+
+	/* Initialize all indices to "not found" */
+	ff->idx_range = RS50_FEATURE_NOT_FOUND;
+	ff->idx_strength = RS50_FEATURE_NOT_FOUND;
+	ff->idx_damping = RS50_FEATURE_NOT_FOUND;
+	ff->idx_trueforce = RS50_FEATURE_NOT_FOUND;
+	ff->idx_brakeforce = RS50_FEATURE_NOT_FOUND;
+	ff->idx_filter = RS50_FEATURE_NOT_FOUND;
+	ff->idx_brightness = RS50_FEATURE_NOT_FOUND;
+	ff->idx_lightsync = RS50_FEATURE_NOT_FOUND;
+
+	/* Discover each feature - failures are OK, just means not supported */
+	ret = hidpp_root_get_feature(hidpp, RS50_PAGE_RANGE, &ff->idx_range);
+	if (ret == 0)
+		pr_debug("rs50_ff: range feature at index 0x%02x\n", ff->idx_range);
+	else if (ret != -ENOENT)
+		pr_debug("rs50_ff: range feature lookup failed: %d\n", ret);
+
+	ret = hidpp_root_get_feature(hidpp, RS50_PAGE_STRENGTH, &ff->idx_strength);
+	if (ret == 0)
+		pr_debug("rs50_ff: strength feature at index 0x%02x\n", ff->idx_strength);
+
+	ret = hidpp_root_get_feature(hidpp, RS50_PAGE_DAMPING, &ff->idx_damping);
+	if (ret == 0)
+		pr_debug("rs50_ff: damping feature at index 0x%02x\n", ff->idx_damping);
+
+	ret = hidpp_root_get_feature(hidpp, RS50_PAGE_TRUEFORCE, &ff->idx_trueforce);
+	if (ret == 0)
+		pr_debug("rs50_ff: trueforce feature at index 0x%02x\n", ff->idx_trueforce);
+
+	ret = hidpp_root_get_feature(hidpp, RS50_PAGE_BRAKEFORCE, &ff->idx_brakeforce);
+	if (ret == 0)
+		pr_debug("rs50_ff: brakeforce feature at index 0x%02x\n", ff->idx_brakeforce);
+
+	ret = hidpp_root_get_feature(hidpp, RS50_PAGE_FILTER, &ff->idx_filter);
+	if (ret == 0)
+		pr_debug("rs50_ff: filter feature at index 0x%02x\n", ff->idx_filter);
+
+	ret = hidpp_root_get_feature(hidpp, RS50_PAGE_BRIGHTNESS, &ff->idx_brightness);
+	if (ret == 0)
+		pr_debug("rs50_ff: brightness feature at index 0x%02x\n", ff->idx_brightness);
+
+	ret = hidpp_root_get_feature(hidpp, RS50_PAGE_LIGHTSYNC, &ff->idx_lightsync);
+	if (ret == 0)
+		pr_debug("rs50_ff: lightsync feature at index 0x%02x\n", ff->idx_lightsync);
+
+	pr_debug("rs50_ff: feature discovery completed\n");
+}
+
+/*
+ * Query current device settings using discovered feature indices.
+ */
+static void rs50_ff_query_settings(struct rs50_ff_data *ff)
+{
+	struct hidpp_device *hidpp = ff->hidpp;
+	struct hidpp_report response;
+	u8 params[3] = {0, 0, 0};
+	int ret;
+	u16 value;
+
+	if (!hidpp)
+		return;
+
+	pr_debug("rs50_ff: querying device settings\n");
+
+	/* Query rotation range */
+	if (ff->idx_range != RS50_FEATURE_NOT_FOUND) {
+		ret = hidpp_send_fap_command_sync(hidpp, ff->idx_range,
+						  RS50_HIDPP_FN_GET, params, 0, &response);
+		if (ret == 0) {
+			value = (response.fap.params[0] << 8) | response.fap.params[1];
+			if (value >= 90 && value <= 2700) {
+				ff->range = value;
+				pr_info("rs50_ff: device range = %d degrees\n", value);
+			}
+		}
+	}
+
+	/* Query FFB strength */
+	if (ff->idx_strength != RS50_FEATURE_NOT_FOUND) {
+		ret = hidpp_send_fap_command_sync(hidpp, ff->idx_strength,
+						  RS50_HIDPP_FN_GET, params, 0, &response);
+		if (ret == 0) {
+			value = (response.fap.params[0] << 8) | response.fap.params[1];
+			ff->strength = value;
+			pr_info("rs50_ff: device strength = %d%%\n", (value * 100) / 65535);
+		}
+	}
+
+	/* Query damping */
+	if (ff->idx_damping != RS50_FEATURE_NOT_FOUND) {
+		ret = hidpp_send_fap_command_sync(hidpp, ff->idx_damping,
+						  RS50_HIDPP_FN_GET, params, 0, &response);
+		if (ret == 0) {
+			value = (response.fap.params[0] << 8) | response.fap.params[1];
+			ff->damping = value;
+			pr_info("rs50_ff: device damping = %d%%\n", (value * 100) / 65535);
+		}
+	}
+
+	/* Query TRUEFORCE */
+	if (ff->idx_trueforce != RS50_FEATURE_NOT_FOUND) {
+		ret = hidpp_send_fap_command_sync(hidpp, ff->idx_trueforce,
+						  RS50_HIDPP_FN_GET, params, 0, &response);
+		if (ret == 0) {
+			value = (response.fap.params[0] << 8) | response.fap.params[1];
+			ff->trueforce = value;
+			pr_info("rs50_ff: device trueforce = %d%%\n", (value * 100) / 65535);
+		}
+	}
+
+	/* Query brake force */
+	if (ff->idx_brakeforce != RS50_FEATURE_NOT_FOUND) {
+		ret = hidpp_send_fap_command_sync(hidpp, ff->idx_brakeforce,
+						  RS50_HIDPP_FN_GET, params, 0, &response);
+		if (ret == 0) {
+			value = (response.fap.params[0] << 8) | response.fap.params[1];
+			ff->brake_force = value;
+			pr_info("rs50_ff: device brake_force = %d%%\n", (value * 100) / 65535);
+		}
+	}
+
+	/* Query FFB filter */
+	if (ff->idx_filter != RS50_FEATURE_NOT_FOUND) {
+		ret = hidpp_send_fap_command_sync(hidpp, ff->idx_filter,
+						  RS50_HIDPP_FN_GET, params, 0, &response);
+		if (ret == 0) {
+			ff->ffb_filter_auto = (response.fap.params[0] == 0x04) ? 1 : 0;
+			ff->ffb_filter = response.fap.params[2];
+			pr_info("rs50_ff: device ffb_filter = %d, auto = %d\n",
+				ff->ffb_filter, ff->ffb_filter_auto);
+		}
+	}
+
+	/* Query LED brightness */
+	if (ff->idx_brightness != RS50_FEATURE_NOT_FOUND) {
+		ret = hidpp_send_fap_command_sync(hidpp, ff->idx_brightness,
+						  RS50_HIDPP_FN_GET, params, 0, &response);
+		if (ret == 0) {
+			ff->led_brightness = response.fap.params[1];
+			pr_info("rs50_ff: device led_brightness = %d%%\n", ff->led_brightness);
+		}
+	}
+
+	pr_debug("rs50_ff: settings query completed\n");
+}
+
+/*
+ * Deferred FFB initialization - runs after a delay to ensure all
+ * USB interfaces are fully initialized before we access them.
+ */
+static void rs50_ff_init_work(struct work_struct *work)
+{
+	struct rs50_ff_data *ff = container_of(work, struct rs50_ff_data,
+					       init_work.work);
+	struct hidpp_device *hidpp = ff->hidpp;
+	struct hid_device *hid = hidpp->hid_dev;
+	struct usb_interface *iface2;
+	struct hid_device *ff_hdev;
+	struct hid_device *input_hdev;
+	struct hid_input *hidinput;
+	struct input_dev *input;
+	int ret;
+
+	pr_debug("rs50_ff: init_work started\n");
+
+	/* Check if we're being shut down */
+	if (atomic_read_acquire(&ff->stopping)) {
+		pr_debug("rs50_ff: init_work: stopping flag set, aborting\n");
+		return;
+	}
+
+	pr_debug("rs50_ff: getting interface 2\n");
+	iface2 = usb_ifnum_to_if(hid_to_usb_dev(hid), 2);
+	if (!iface2) {
+		hid_err(hid, "RS50: interface 2 not found\n");
+		return;
+	}
+
+	pr_debug("rs50_ff: getting ff_hdev from interface 2\n");
+	ff_hdev = usb_get_intfdata(iface2);
+	if (!ff_hdev) {
+		hid_err(hid, "RS50: no hid_device on interface 2\n");
+		return;
+	}
+
+	pr_debug("rs50_ff: getting input_hdev from interface 0\n");
+	input_hdev = usb_get_intfdata(usb_ifnum_to_if(hid_to_usb_dev(hid), 0));
+	if (!input_hdev) {
+		hid_err(hid, "RS50: no hid_device on interface 0\n");
+		return;
+	}
+
+	pr_debug("rs50_ff: checking inputs list\n");
+	if (list_empty(&input_hdev->inputs)) {
+		hid_err(hid, "RS50: no inputs on interface 0\n");
+		return;
+	}
+
+	pr_debug("rs50_ff: getting input device\n");
+	hidinput = list_entry(input_hdev->inputs.next, struct hid_input, list);
+	input = hidinput->input;
+	if (!input) {
+		hid_err(hid, "RS50: input_dev not found\n");
+		return;
+	}
+
+	/* Store references */
+	ff->ff_hdev = ff_hdev;
+	ff->input = input;
+
+	pr_debug("rs50_ff: setting FF capability bits\n");
+	/*
+	 * Register FF capabilities with custom effect handling.
+	 * We implement condition effects ourselves instead of using ff-memless.
+	 */
+
+	/* Create FF device with our custom handlers */
+	ret = input_ff_create(input, RS50_FF_MAX_EFFECTS);
+	if (ret) {
+		hid_err(hid, "RS50: failed to create FF device: %d\n", ret);
+		return;
+	}
+
+	input->ff->private = ff;
+	input->ff->upload = rs50_ff_upload;
+	input->ff->erase = rs50_ff_erase;
+	input->ff->playback = rs50_ff_playback;
+	input->ff->set_gain = rs50_ff_set_gain;
+
+	/* Constant force - primary effect for racing games */
+	set_bit(FF_CONSTANT, input->ffbit);
+
+	/* Condition effects - we implement these ourselves */
+	set_bit(FF_SPRING, input->ffbit);
+	set_bit(FF_DAMPER, input->ffbit);
+	set_bit(FF_FRICTION, input->ffbit);
+	set_bit(FF_INERTIA, input->ffbit);
+
+	/*
+	 * Note: FF_PERIODIC, FF_SINE, FF_RUMBLE etc. are NOT implemented.
+	 * Only FF_CONSTANT and condition effects are supported by this driver.
+	 * Games will fall back to FF_CONSTANT for unsupported effect types.
+	 */
+
+	/* Gain control */
+	set_bit(FF_GAIN, input->ffbit);
+
+	/* Initialize effects array */
+	memset(ff->effects, 0, sizeof(ff->effects));
+
+	/* Initialize position history */
+	memset(&ff->pos_history, 0, sizeof(ff->pos_history));
+
+	/* Mark as fully initialized - timer was already set up in rs50_ff_init() */
+	atomic_set(&ff->initialized, 1);
+
+	/* Start the periodic FFB refresh timer (05 07 command) */
+	queue_delayed_work(ff->wq, &ff->refresh_work,
+			   msecs_to_jiffies(RS50_FF_REFRESH_INTERVAL_MS));
+	pr_debug("rs50_ff: refresh timer started (interval=%dms)\n",
+		RS50_FF_REFRESH_INTERVAL_MS);
+
+	/* Start the condition effect timer */
+	mod_timer(&ff->effect_timer,
+		  jiffies + msecs_to_jiffies(RS50_FF_TIMER_INTERVAL_MS));
+	pr_debug("rs50_ff: effect timer started (interval=%dms)\n",
+		RS50_FF_TIMER_INTERVAL_MS);
+
+	/*
+	 * Re-open the HID device for IO before sending HID++ commands.
+	 * hidpp_probe() calls hid_hw_close() after completing, which stops
+	 * the interrupt IN endpoint. We need it active to receive responses.
+	 *
+	 * IMPORTANT: We do NOT close it here - we keep it open for runtime
+	 * HID++ communication via sysfs. It will be closed in rs50_ff_destroy().
+	 */
+	ret = hid_hw_open(hid);
+	if (ret) {
+		hid_err(hid, "RS50: failed to open device for feature discovery: %d\n", ret);
+		goto skip_hidpp;
+	}
+	ff->hid_open = true;
+
+	/* Discover HID++ feature indices before querying settings */
+	rs50_ff_discover_features(ff);
+
+	/* Query device settings to sync our cached values */
+	rs50_ff_query_settings(ff);
+
+skip_hidpp:
+
+	hid_info(hid, "RS50 force feedback initialized with condition effects support\n");
+	pr_debug("rs50_ff: init_work completed successfully\n");
+}
+
+/*
+ * RS50 sysfs attributes for wheel settings.
+ * These use HID++ protocol via interface 1 to configure the wheel.
+ */
+
+static ssize_t rs50_range_show(struct device *dev, struct device_attribute *attr,
+			       char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", ff->range);
+}
+
+static ssize_t rs50_range_store(struct device *dev, struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+	struct hidpp_report response;
+	u8 params[3];
+	int range, ret;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	ret = kstrtoint(buf, 10, &range);
+	if (ret)
+		return ret;
+
+	/* RS50 supports 90-2700 degrees rotation */
+	range = clamp(range, 90, 2700);
+
+	if (ff->idx_range == RS50_FEATURE_NOT_FOUND)
+		return -EOPNOTSUPP;
+
+	params[0] = (range >> 8) & 0xFF;	/* High byte */
+	params[1] = range & 0xFF;		/* Low byte */
+	params[2] = 0;
+
+	ret = hidpp_send_fap_command_sync(hidpp, ff->idx_range,
+					  RS50_HIDPP_FN_SET, params, 3, &response);
+	if (ret) {
+		if (ret > 0)
+			hid_err(hid, "RS50: HID++ error 0x%02x setting range\n", ret);
+		else
+			hid_err(hid, "RS50: failed to set range: %d\n", ret);
+		return ret < 0 ? ret : -EIO;
+	}
+
+	ff->range = range;
+	hid_info(hid, "RS50: rotation range set to %d degrees\n", range);
+	return count;
+}
+
+static DEVICE_ATTR(rs50_range, 0664,
+		   rs50_range_show, rs50_range_store);
+
+/*
+ * Oversteer-compatible 'range' attribute - same functionality as rs50_range.
+ * Named differently internally to avoid conflict with hidpp_ff's dev_attr_range.
+ */
+static struct device_attribute dev_attr_rs50_compat_range =
+	__ATTR(range, 0664, rs50_range_show, rs50_range_store);
+
+static ssize_t rs50_strength_show(struct device *dev, struct device_attribute *attr,
+				  char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	/* Convert from 0-65535 range to 0-100 percentage */
+	return scnprintf(buf, PAGE_SIZE, "%u\n", (ff->strength * 100) / 65535);
+}
+
+static ssize_t rs50_strength_store(struct device *dev, struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+	struct hidpp_report response;
+	u8 params[3];
+	int strength, ret;
+	u16 value;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	ret = kstrtoint(buf, 10, &strength);
+	if (ret)
+		return ret;
+
+	/* Clamp to 0-100% */
+	strength = clamp(strength, 0, 100);
+
+	if (ff->idx_strength == RS50_FEATURE_NOT_FOUND)
+		return -EOPNOTSUPP;
+
+	/* Convert percentage to 0-65535 range */
+	value = (strength * 65535) / 100;
+
+	params[0] = (value >> 8) & 0xFF;	/* High byte */
+	params[1] = value & 0xFF;		/* Low byte */
+	params[2] = 0;
+
+	ret = hidpp_send_fap_command_sync(hidpp, ff->idx_strength,
+					  RS50_HIDPP_FN_SET, params, 3, &response);
+	if (ret) {
+		if (ret > 0)
+			hid_err(hid, "RS50: HID++ error 0x%02x setting strength\n", ret);
+		else
+			hid_err(hid, "RS50: failed to set strength: %d\n", ret);
+		return ret < 0 ? ret : -EIO;
+	}
+
+	ff->strength = value;
+	hid_info(hid, "RS50: FFB strength set to %d%%\n", strength);
+	return count;
+}
+
+static DEVICE_ATTR(rs50_strength, 0664,
+		   rs50_strength_show, rs50_strength_store);
+
+/*
+ * Oversteer-compatible 'gain' attribute - same functionality as rs50_strength.
+ * Oversteer uses 'gain' for FFB strength control.
+ */
+static struct device_attribute dev_attr_rs50_compat_gain =
+	__ATTR(gain, 0664, rs50_strength_show, rs50_strength_store);
+
+/*
+ * Oversteer-compatible 'autocenter' attribute.
+ * The RS50 autocenter HID++ feature has not been discovered yet.
+ * This is a stub that stores the value locally for Oversteer compatibility.
+ * TODO: Implement once we discover the autocenter HID++ page/function.
+ */
+static ssize_t rs50_autocenter_show(struct device *dev, struct device_attribute *attr,
+				    char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", ff->autocenter);
+}
+
+static ssize_t rs50_autocenter_store(struct device *dev, struct device_attribute *attr,
+				     const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+	int val, ret;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	ret = kstrtoint(buf, 10, &val);
+	if (ret)
+		return ret;
+
+	/* Clamp to 0-100 range */
+	ff->autocenter = clamp(val, 0, 100);
+
+	/* Note: RS50 uses physical springs, no command sent to device */
+	return count;
+}
+
+static struct device_attribute dev_attr_rs50_compat_autocenter =
+	__ATTR(autocenter, 0664, rs50_autocenter_show, rs50_autocenter_store);
+
+static ssize_t rs50_damping_show(struct device *dev, struct device_attribute *attr,
+				 char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	/* Convert from 0-65535 range to 0-100 percentage */
+	return scnprintf(buf, PAGE_SIZE, "%u\n", (ff->damping * 100) / 65535);
+}
+
+static ssize_t rs50_damping_store(struct device *dev, struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+	struct hidpp_report response;
+	u8 params[3];
+	int damping, ret;
+	u16 value;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	ret = kstrtoint(buf, 10, &damping);
+	if (ret)
+		return ret;
+
+	/* Clamp to 0-100 */
+	damping = clamp(damping, 0, 100);
+
+	if (ff->idx_damping == RS50_FEATURE_NOT_FOUND)
+		return -EOPNOTSUPP;
+
+	/* Convert to 0-65535 range */
+	value = (damping * 65535) / 100;
+
+	params[0] = (value >> 8) & 0xFF;	/* High byte */
+	params[1] = value & 0xFF;		/* Low byte */
+	params[2] = 0;
+
+	/* Damping uses function 1 (0x10) instead of function 2 */
+	ret = hidpp_send_fap_command_sync(hidpp, ff->idx_damping,
+					  RS50_HIDPP_FN_SET, params, 3, &response);
+	if (ret) {
+		if (ret > 0)
+			hid_err(hid, "RS50: HID++ error 0x%02x setting damping\n", ret);
+		else
+			hid_err(hid, "RS50: failed to set damping: %d\n", ret);
+		return ret < 0 ? ret : -EIO;
+	}
+
+	ff->damping = value;
+	hid_info(hid, "RS50: damping set to %d\n", damping);
+	return count;
+}
+
+static DEVICE_ATTR(rs50_damping, 0664,
+		   rs50_damping_show, rs50_damping_store);
+
+/*
+ * Oversteer-compatible 'damper_level' attribute - same as rs50_damping.
+ */
+static struct device_attribute dev_attr_rs50_compat_damper_level =
+	__ATTR(damper_level, 0664, rs50_damping_show, rs50_damping_store);
+
+/* TRUEFORCE - audio-haptic feedback intensity */
+static ssize_t rs50_trueforce_show(struct device *dev, struct device_attribute *attr,
+				   char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", (ff->trueforce * 100) / 65535);
+}
+
+static ssize_t rs50_trueforce_store(struct device *dev, struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+	struct hidpp_report response;
+	u8 params[3];
+	int trueforce, ret;
+	u16 value;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	ret = kstrtoint(buf, 10, &trueforce);
+	if (ret)
+		return ret;
+
+	if (ff->idx_trueforce == RS50_FEATURE_NOT_FOUND)
+		return -EOPNOTSUPP;
+
+	trueforce = clamp(trueforce, 0, 100);
+	value = (trueforce * 65535) / 100;
+
+	params[0] = (value >> 8) & 0xFF;
+	params[1] = value & 0xFF;
+	params[2] = 0;
+
+	/* TRUEFORCE uses function 2 (0x20) */
+	ret = hidpp_send_fap_command_sync(hidpp, ff->idx_trueforce,
+					  RS50_HIDPP_FN_SET_ALT, params, 3, &response);
+	if (ret) {
+		if (ret > 0)
+			hid_err(hid, "RS50: HID++ error 0x%02x setting TRUEFORCE\n", ret);
+		else
+			hid_err(hid, "RS50: failed to set TRUEFORCE: %d\n", ret);
+		return ret < 0 ? ret : -EIO;
+	}
+
+	ff->trueforce = value;
+	hid_info(hid, "RS50: TRUEFORCE set to %d%%\n", trueforce);
+	return count;
+}
+
+static DEVICE_ATTR(rs50_trueforce, 0664,
+		   rs50_trueforce_show, rs50_trueforce_store);
+
+/* Brake Force - load cell threshold */
+static ssize_t rs50_brake_force_show(struct device *dev, struct device_attribute *attr,
+				     char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", (ff->brake_force * 100) / 65535);
+}
+
+static ssize_t rs50_brake_force_store(struct device *dev, struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+	struct hidpp_report response;
+	u8 params[3];
+	int brake_force, ret;
+	u16 value;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	ret = kstrtoint(buf, 10, &brake_force);
+	if (ret)
+		return ret;
+
+	if (ff->idx_brakeforce == RS50_FEATURE_NOT_FOUND)
+		return -EOPNOTSUPP;
+
+	brake_force = clamp(brake_force, 0, 100);
+	value = (brake_force * 65535) / 100;
+
+	params[0] = (value >> 8) & 0xFF;
+	params[1] = value & 0xFF;
+	params[2] = 0;
+
+	ret = hidpp_send_fap_command_sync(hidpp, ff->idx_brakeforce,
+					  RS50_HIDPP_FN_SET, params, 3, &response);
+	if (ret) {
+		if (ret > 0)
+			hid_err(hid, "RS50: HID++ error 0x%02x setting brake force\n", ret);
+		else
+			hid_err(hid, "RS50: failed to set brake force: %d\n", ret);
+		return ret < 0 ? ret : -EIO;
+	}
+
+	ff->brake_force = value;
+	hid_info(hid, "RS50: brake force set to %d%%\n", brake_force);
+	return count;
+}
+
+static DEVICE_ATTR(rs50_brake_force, 0664,
+		   rs50_brake_force_show, rs50_brake_force_store);
+
+/* FFB Filter - smoothing level and auto toggle */
+static ssize_t rs50_ffb_filter_show(struct device *dev, struct device_attribute *attr,
+				    char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", ff->ffb_filter);
+}
+
+static ssize_t rs50_ffb_filter_store(struct device *dev, struct device_attribute *attr,
+				     const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+	struct hidpp_report response;
+	u8 params[3];
+	int filter, ret;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	ret = kstrtoint(buf, 10, &filter);
+	if (ret)
+		return ret;
+
+	if (ff->idx_filter == RS50_FEATURE_NOT_FOUND)
+		return -EOPNOTSUPP;
+
+	/* Filter range: 1-15 (0x01-0x0F) */
+	filter = clamp(filter, 1, 15);
+
+	/* FFB Filter command: auto_flag, 0x00, level */
+	params[0] = ff->ffb_filter_auto ? 0x04 : 0x00;
+	params[1] = 0x00;
+	params[2] = filter;
+
+	ret = hidpp_send_fap_command_sync(hidpp, ff->idx_filter,
+					  RS50_HIDPP_FN_SET, params, 3, &response);
+	if (ret) {
+		if (ret > 0)
+			hid_err(hid, "RS50: HID++ error 0x%02x setting FFB filter\n", ret);
+		else
+			hid_err(hid, "RS50: failed to set FFB filter: %d\n", ret);
+		return ret < 0 ? ret : -EIO;
+	}
+
+	ff->ffb_filter = filter;
+	hid_info(hid, "RS50: FFB filter set to %d\n", filter);
+	return count;
+}
+
+static DEVICE_ATTR(rs50_ffb_filter, 0664,
+		   rs50_ffb_filter_show, rs50_ffb_filter_store);
+
+/* FFB Filter Auto - automatic filter adjustment */
+static ssize_t rs50_ffb_filter_auto_show(struct device *dev, struct device_attribute *attr,
+					 char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", ff->ffb_filter_auto);
+}
+
+static ssize_t rs50_ffb_filter_auto_store(struct device *dev, struct device_attribute *attr,
+					  const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+	struct hidpp_report response;
+	u8 params[3];
+	int auto_mode, ret;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	ret = kstrtoint(buf, 10, &auto_mode);
+	if (ret)
+		return ret;
+
+	if (ff->idx_filter == RS50_FEATURE_NOT_FOUND)
+		return -EOPNOTSUPP;
+
+	auto_mode = !!auto_mode; /* Normalize to 0 or 1 */
+
+	/* FFB Filter command: auto_flag, 0x00, level */
+	params[0] = auto_mode ? 0x04 : 0x00;
+	params[1] = 0x00;
+	params[2] = ff->ffb_filter;
+
+	ret = hidpp_send_fap_command_sync(hidpp, ff->idx_filter,
+					  RS50_HIDPP_FN_SET, params, 3, &response);
+	if (ret) {
+		if (ret > 0)
+			hid_err(hid, "RS50: HID++ error 0x%02x setting FFB filter auto\n", ret);
+		else
+			hid_err(hid, "RS50: failed to set FFB filter auto: %d\n", ret);
+		return ret < 0 ? ret : -EIO;
+	}
+
+	ff->ffb_filter_auto = auto_mode;
+	hid_info(hid, "RS50: FFB filter auto %s\n", auto_mode ? "enabled" : "disabled");
+	return count;
+}
+
+static DEVICE_ATTR(rs50_ffb_filter_auto, 0664,
+		   rs50_ffb_filter_auto_show, rs50_ffb_filter_auto_store);
+
+/* LIGHTSYNC LED effect */
+static ssize_t rs50_led_effect_show(struct device *dev, struct device_attribute *attr,
+				    char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", ff->led_effect);
+}
+
+static ssize_t rs50_led_effect_store(struct device *dev, struct device_attribute *attr,
+				     const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+	struct hidpp_report response;
+	u8 params[3];
+	int effect, ret;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	ret = kstrtoint(buf, 10, &effect);
+	if (ret)
+		return ret;
+
+	if (ff->idx_lightsync == RS50_FEATURE_NOT_FOUND)
+		return -EOPNOTSUPP;
+
+	/* Effect values: 1=Inside→Out, 2=Outside→In, 3=Right→Left, 4=Left→Right, 5=Static */
+	effect = clamp(effect, 1, 5);
+
+	params[0] = effect;
+	params[1] = 0x00;
+	params[2] = 0x00;
+
+	/* LIGHTSYNC uses function 2 (0x20) with 0x0C suffix = 0x2C */
+	ret = hidpp_send_fap_command_sync(hidpp, ff->idx_lightsync,
+					  RS50_HIDPP_FN_SET_ALT | 0x0C, params, 3, &response);
+	if (ret) {
+		if (ret > 0)
+			hid_err(hid, "RS50: HID++ error 0x%02x setting LED effect\n", ret);
+		else
+			hid_err(hid, "RS50: failed to set LED effect: %d\n", ret);
+		return ret < 0 ? ret : -EIO;
+	}
+
+	ff->led_effect = effect;
+	hid_info(hid, "RS50: LED effect set to %d\n", effect);
+	return count;
+}
+
+static DEVICE_ATTR(rs50_led_effect, 0664,
+		   rs50_led_effect_show, rs50_led_effect_store);
+
+/* LED brightness */
+static ssize_t rs50_led_brightness_show(struct device *dev, struct device_attribute *attr,
+					char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", ff->led_brightness);
+}
+
+static ssize_t rs50_led_brightness_store(struct device *dev, struct device_attribute *attr,
+					 const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+	struct hidpp_report response;
+	u8 params[3];
+	int brightness, ret;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	ret = kstrtoint(buf, 10, &brightness);
+	if (ret)
+		return ret;
+
+	if (ff->idx_brightness == RS50_FEATURE_NOT_FOUND)
+		return -EOPNOTSUPP;
+
+	brightness = clamp(brightness, 0, 100);
+
+	/* Brightness command: 00, value, 00 */
+	params[0] = 0x00;
+	params[1] = brightness;
+	params[2] = 0x00;
+
+	ret = hidpp_send_fap_command_sync(hidpp, ff->idx_brightness,
+					  RS50_HIDPP_FN_SET, params, 3, &response);
+	if (ret) {
+		if (ret > 0)
+			hid_err(hid, "RS50: HID++ error 0x%02x setting LED brightness\n", ret);
+		else
+			hid_err(hid, "RS50: failed to set LED brightness: %d\n", ret);
+		return ret < 0 ? ret : -EIO;
+	}
+
+	ff->led_brightness = brightness;
+	hid_info(hid, "RS50: LED brightness set to %d%%\n", brightness);
+	return count;
+}
+
+static DEVICE_ATTR(rs50_led_brightness, 0664,
+		   rs50_led_brightness_show, rs50_led_brightness_store);
+
+/* Combined pedals mode - outputs (throttle - brake) on single axis */
+static ssize_t rs50_combined_pedals_show(struct device *dev, struct device_attribute *attr,
+					 char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", ff->combined_pedals);
+}
+
+static ssize_t rs50_combined_pedals_store(struct device *dev, struct device_attribute *attr,
+					  const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+	int val, ret;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	ret = kstrtoint(buf, 10, &val);
+	if (ret)
+		return ret;
+
+	WRITE_ONCE(ff->combined_pedals, val ? 1 : 0);
+	hid_info(hid, "RS50: combined pedals mode %s\n",
+		 READ_ONCE(ff->combined_pedals) ? "enabled" : "disabled");
+	return count;
+}
+
+static DEVICE_ATTR(rs50_combined_pedals, 0664,
+		   rs50_combined_pedals_show, rs50_combined_pedals_store);
+
+/*
+ * Oversteer-compatible 'combine_pedals' attribute - same as rs50_combined_pedals.
+ */
+static struct device_attribute dev_attr_rs50_compat_combine_pedals =
+	__ATTR(combine_pedals, 0664, rs50_combined_pedals_show, rs50_combined_pedals_store);
+
+/* Throttle response curve: 0=linear, 1=low sensitivity, 2=high sensitivity */
+static ssize_t rs50_throttle_curve_show(struct device *dev, struct device_attribute *attr,
+					char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", ff->throttle_curve);
+}
+
+static ssize_t rs50_throttle_curve_store(struct device *dev, struct device_attribute *attr,
+					 const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+	int val, ret;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	ret = kstrtoint(buf, 10, &val);
+	if (ret)
+		return ret;
+
+	if (val < 0 || val > 2)
+		return -EINVAL;
+
+	WRITE_ONCE(ff->throttle_curve, val);
+	hid_info(hid, "RS50: throttle curve set to %d (%s)\n", val,
+		 val == 0 ? "linear" : (val == 1 ? "low sens" : "high sens"));
+	return count;
+}
+
+static DEVICE_ATTR(rs50_throttle_curve, 0664,
+		   rs50_throttle_curve_show, rs50_throttle_curve_store);
+
+/* Brake response curve: 0=linear, 1=low sensitivity, 2=high sensitivity */
+static ssize_t rs50_brake_curve_show(struct device *dev, struct device_attribute *attr,
+				     char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", ff->brake_curve);
+}
+
+static ssize_t rs50_brake_curve_store(struct device *dev, struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+	int val, ret;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	ret = kstrtoint(buf, 10, &val);
+	if (ret)
+		return ret;
+
+	if (val < 0 || val > 2)
+		return -EINVAL;
+
+	WRITE_ONCE(ff->brake_curve, val);
+	hid_info(hid, "RS50: brake curve set to %d (%s)\n", val,
+		 val == 0 ? "linear" : (val == 1 ? "low sens" : "high sens"));
+	return count;
+}
+
+static DEVICE_ATTR(rs50_brake_curve, 0664,
+		   rs50_brake_curve_show, rs50_brake_curve_store);
+
+/* Clutch response curve: 0=linear, 1=low sensitivity, 2=high sensitivity */
+static ssize_t rs50_clutch_curve_show(struct device *dev, struct device_attribute *attr,
+				      char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", ff->clutch_curve);
+}
+
+static ssize_t rs50_clutch_curve_store(struct device *dev, struct device_attribute *attr,
+				       const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+	int val, ret;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	ret = kstrtoint(buf, 10, &val);
+	if (ret)
+		return ret;
+
+	if (val < 0 || val > 2)
+		return -EINVAL;
+
+	WRITE_ONCE(ff->clutch_curve, val);
+	hid_info(hid, "RS50: clutch curve set to %d (%s)\n", val,
+		 val == 0 ? "linear" : (val == 1 ? "low sens" : "high sens"));
+	return count;
+}
+
+static DEVICE_ATTR(rs50_clutch_curve, 0664,
+		   rs50_clutch_curve_show, rs50_clutch_curve_store);
+
+/* Throttle deadzone: format "lower upper" (0-100 each) */
+static ssize_t rs50_throttle_deadzone_show(struct device *dev, struct device_attribute *attr,
+					   char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	return scnprintf(buf, PAGE_SIZE, "%u %u\n",
+			 ff->throttle_deadzone_lower, ff->throttle_deadzone_upper);
+}
+
+static ssize_t rs50_throttle_deadzone_store(struct device *dev, struct device_attribute *attr,
+					    const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+	int lower, upper;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	if (sscanf(buf, "%d %d", &lower, &upper) != 2)
+		return -EINVAL;
+
+	lower = clamp(lower, 0, 100);
+	upper = clamp(upper, 0, 100);
+
+	WRITE_ONCE(ff->throttle_deadzone_lower, lower);
+	WRITE_ONCE(ff->throttle_deadzone_upper, upper);
+	hid_info(hid, "RS50: throttle deadzone set to %d%% - %d%%\n", lower, 100 - upper);
+	return count;
+}
+
+static DEVICE_ATTR(rs50_throttle_deadzone, 0664,
+		   rs50_throttle_deadzone_show, rs50_throttle_deadzone_store);
+
+/* Brake deadzone: format "lower upper" (0-100 each) */
+static ssize_t rs50_brake_deadzone_show(struct device *dev, struct device_attribute *attr,
+					char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	return scnprintf(buf, PAGE_SIZE, "%u %u\n",
+			 ff->brake_deadzone_lower, ff->brake_deadzone_upper);
+}
+
+static ssize_t rs50_brake_deadzone_store(struct device *dev, struct device_attribute *attr,
+					 const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+	int lower, upper;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	if (sscanf(buf, "%d %d", &lower, &upper) != 2)
+		return -EINVAL;
+
+	lower = clamp(lower, 0, 100);
+	upper = clamp(upper, 0, 100);
+
+	WRITE_ONCE(ff->brake_deadzone_lower, lower);
+	WRITE_ONCE(ff->brake_deadzone_upper, upper);
+	hid_info(hid, "RS50: brake deadzone set to %d%% - %d%%\n", lower, 100 - upper);
+	return count;
+}
+
+static DEVICE_ATTR(rs50_brake_deadzone, 0664,
+		   rs50_brake_deadzone_show, rs50_brake_deadzone_store);
+
+/* Clutch deadzone: format "lower upper" (0-100 each) */
+static ssize_t rs50_clutch_deadzone_show(struct device *dev, struct device_attribute *attr,
+					 char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	return scnprintf(buf, PAGE_SIZE, "%u %u\n",
+			 ff->clutch_deadzone_lower, ff->clutch_deadzone_upper);
+}
+
+static ssize_t rs50_clutch_deadzone_store(struct device *dev, struct device_attribute *attr,
+					  const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+	int lower, upper;
+
+	if (!hidpp || !hidpp->private_data)
+		return -ENODEV;
+
+	ff = hidpp->private_data;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	if (sscanf(buf, "%d %d", &lower, &upper) != 2)
+		return -EINVAL;
+
+	lower = clamp(lower, 0, 100);
+	upper = clamp(upper, 0, 100);
+
+	WRITE_ONCE(ff->clutch_deadzone_lower, lower);
+	WRITE_ONCE(ff->clutch_deadzone_upper, upper);
+	hid_info(hid, "RS50: clutch deadzone set to %d%% - %d%%\n", lower, 100 - upper);
+	return count;
+}
+
+static DEVICE_ATTR(rs50_clutch_deadzone, 0664,
+		   rs50_clutch_deadzone_show, rs50_clutch_deadzone_store);
+
+/*
+ * RS50 input mapping - ignore phantom buttons declared in HID descriptor.
+ *
+ * The RS50 HID descriptor declares buttons 1-92 but only ~20 physically exist.
+ * Buttons 81-92 overflow past Linux's valid input code range (max 767), causing
+ * "Invalid code 768 type 1" kernel messages.
+ *
+ * This function is called during input device setup. Returning -1 tells the
+ * HID layer to ignore this usage (not create an input mapping for it).
+ */
+static int rs50_input_mapping(struct hid_device *hdev, struct hid_input *hi,
+			      struct hid_field *field, struct hid_usage *usage,
+			      unsigned long **bit, int *max)
+{
+	/* Only filter Button page usages */
+	if ((usage->hid & HID_USAGE_PAGE) != HID_UP_BUTTON)
+		return 0;
+
+	/* Get the button number (usage ID within Button page) */
+	unsigned int button = usage->hid & HID_USAGE;
+
+	/*
+	 * Ignore buttons beyond the maximum that map to valid Linux codes.
+	 * Buttons 1-80 map to valid BTN_* codes, but 81+ overflow.
+	 */
+	if (button > RS50_MAX_BUTTON_USAGE) {
+		hid_dbg(hdev, "RS50: ignoring phantom button %u\n", button);
+		return -1;	/* Ignore this usage */
+	}
+
+	return 0;	/* Let HID core handle normally */
+}
+
+static int rs50_ff_init(struct hidpp_device *hidpp)
+{
+	struct hid_device *hid = hidpp->hid_dev;
+	struct rs50_ff_data *ff;
+
+	pr_debug("rs50_ff: rs50_ff_init started\n");
+
+	if (!hid_is_usb(hid)) {
+		hid_err(hid, "RS50: device is not USB\n");
+		return -ENODEV;
+	}
+
+	pr_debug("rs50_ff: allocating ff data\n");
+	/* Allocate private data */
+	ff = kzalloc(sizeof(*ff), GFP_KERNEL);
+	if (!ff)
+		return -ENOMEM;
+
+	pr_debug("rs50_ff: creating workqueue\n");
+	/* Create workqueue for async USB transfers */
+	ff->wq = create_singlethread_workqueue("rs50-ffb");
+	if (!ff->wq) {
+		kfree(ff);
+		return -ENOMEM;
+	}
+
+	ff->hidpp = hidpp;
+	ff->range = 1080;	/* RS50 default: 1080 degrees */
+	ff->strength = 65535;	/* Default: 100% */
+	ff->damping = 0;	/* Default: 0% */
+	ff->trueforce = 65535;	/* Default: 100% */
+	ff->brake_force = 65535;/* Default: 100% */
+	ff->ffb_filter = 11;	/* Default: ~mid-range */
+	ff->ffb_filter_auto = 0;/* Default: off */
+	ff->led_effect = 5;	/* Default: Static */
+	ff->led_brightness = 100;/* Default: 100% */
+
+	/* Pedal response curves and combined mode defaults */
+	ff->combined_pedals = 0;	/* Default: off */
+	ff->throttle_curve = RS50_CURVE_LINEAR;
+	ff->brake_curve = RS50_CURVE_LINEAR;
+	ff->clutch_curve = RS50_CURVE_LINEAR;
+	ff->throttle_deadzone_lower = 0;
+	ff->throttle_deadzone_upper = 0;
+	ff->brake_deadzone_lower = 0;
+	ff->brake_deadzone_upper = 0;
+	ff->clutch_deadzone_lower = 0;
+	ff->clutch_deadzone_upper = 0;
+
+	ff->constant_force = 0;
+	ff->last_force = 0;
+	spin_lock_init(&ff->effects_lock);
+	atomic_set(&ff->sequence, 0);
+	atomic_set(&ff->pending_work, 0);
+	atomic_set(&ff->stopping, 0);
+	atomic_set(&ff->initialized, 0);
+	ff->last_err_log = 0;
+	ff->err_count = 0;
+
+	/*
+	 * Initialize effect timer early so timer_delete_sync() in destroy
+	 * is always safe, even if deferred init never runs (early unbind).
+	 * The timer callback checks 'initialized' and won't do anything
+	 * until rs50_ff_init_work() completes and calls mod_timer().
+	 */
+	timer_setup(&ff->effect_timer, rs50_ff_effect_timer_callback, 0);
+
+	/* Store for cleanup in hidpp_remove() */
+	hidpp->private_data = ff;
+
+	/* Create sysfs attributes for wheel settings */
+	if (device_create_file(&hid->dev, &dev_attr_rs50_range))
+		hid_warn(hid, "RS50: failed to create range sysfs attribute\n");
+	if (device_create_file(&hid->dev, &dev_attr_rs50_strength))
+		hid_warn(hid, "RS50: failed to create strength sysfs attribute\n");
+	if (device_create_file(&hid->dev, &dev_attr_rs50_damping))
+		hid_warn(hid, "RS50: failed to create damping sysfs attribute\n");
+	if (device_create_file(&hid->dev, &dev_attr_rs50_trueforce))
+		hid_warn(hid, "RS50: failed to create trueforce sysfs attribute\n");
+	if (device_create_file(&hid->dev, &dev_attr_rs50_brake_force))
+		hid_warn(hid, "RS50: failed to create brake_force sysfs attribute\n");
+	if (device_create_file(&hid->dev, &dev_attr_rs50_ffb_filter))
+		hid_warn(hid, "RS50: failed to create ffb_filter sysfs attribute\n");
+	if (device_create_file(&hid->dev, &dev_attr_rs50_ffb_filter_auto))
+		hid_warn(hid, "RS50: failed to create ffb_filter_auto sysfs attribute\n");
+	if (device_create_file(&hid->dev, &dev_attr_rs50_led_effect))
+		hid_warn(hid, "RS50: failed to create led_effect sysfs attribute\n");
+	if (device_create_file(&hid->dev, &dev_attr_rs50_led_brightness))
+		hid_warn(hid, "RS50: failed to create led_brightness sysfs attribute\n");
+
+	/* Pedal response curve and combined mode sysfs attributes */
+	if (device_create_file(&hid->dev, &dev_attr_rs50_combined_pedals))
+		hid_warn(hid, "RS50: failed to create combined_pedals sysfs attribute\n");
+	if (device_create_file(&hid->dev, &dev_attr_rs50_throttle_curve))
+		hid_warn(hid, "RS50: failed to create throttle_curve sysfs attribute\n");
+	if (device_create_file(&hid->dev, &dev_attr_rs50_brake_curve))
+		hid_warn(hid, "RS50: failed to create brake_curve sysfs attribute\n");
+	if (device_create_file(&hid->dev, &dev_attr_rs50_clutch_curve))
+		hid_warn(hid, "RS50: failed to create clutch_curve sysfs attribute\n");
+	if (device_create_file(&hid->dev, &dev_attr_rs50_throttle_deadzone))
+		hid_warn(hid, "RS50: failed to create throttle_deadzone sysfs attribute\n");
+	if (device_create_file(&hid->dev, &dev_attr_rs50_brake_deadzone))
+		hid_warn(hid, "RS50: failed to create brake_deadzone sysfs attribute\n");
+
+	if (device_create_file(&hid->dev, &dev_attr_rs50_clutch_deadzone))
+		hid_warn(hid, "RS50: failed to create clutch_deadzone sysfs attribute\n");
+
+	/* Oversteer-compatible sysfs attributes (standard names) */
+	if (device_create_file(&hid->dev, &dev_attr_rs50_compat_range))
+		hid_warn(hid, "RS50: failed to create range sysfs attribute\n");
+	if (device_create_file(&hid->dev, &dev_attr_rs50_compat_gain))
+		hid_warn(hid, "RS50: failed to create gain sysfs attribute\n");
+	if (device_create_file(&hid->dev, &dev_attr_rs50_compat_autocenter))
+		hid_warn(hid, "RS50: failed to create autocenter sysfs attribute\n");
+	if (device_create_file(&hid->dev, &dev_attr_rs50_compat_damper_level))
+		hid_warn(hid, "RS50: failed to create damper_level sysfs attribute\n");
+	if (device_create_file(&hid->dev, &dev_attr_rs50_compat_combine_pedals))
+		hid_warn(hid, "RS50: failed to create combine_pedals sysfs attribute\n");
+
+	pr_debug("rs50_ff: scheduling deferred init (delay=%dms)\n",
+		RS50_FF_INIT_DELAY_MS);
+	/*
+	 * Schedule deferred initialization.
+	 * This allows probe to complete quickly and gives other interfaces
+	 * time to fully initialize before we access them.
+	 */
+	INIT_DELAYED_WORK(&ff->init_work, rs50_ff_init_work);
+	INIT_DELAYED_WORK(&ff->refresh_work, rs50_ff_refresh_work);
+	schedule_delayed_work(&ff->init_work,
+			      msecs_to_jiffies(RS50_FF_INIT_DELAY_MS));
+
+	hid_info(hid, "RS50 force feedback scheduled for deferred init\n");
+	pr_debug("rs50_ff: rs50_ff_init completed (deferred init pending)\n");
+	return 0;
+}
+
+static void rs50_ff_destroy(struct hidpp_device *hidpp)
+{
+	struct rs50_ff_data *ff = hidpp->private_data;
+
+	pr_debug("rs50_ff: rs50_ff_destroy started\n");
+
+	if (!ff) {
+		pr_debug("rs50_ff: ff is NULL, nothing to destroy\n");
+		return;
+	}
+
+	/*
+	 * Clear private_data FIRST to prevent any concurrent readers
+	 * (e.g., raw_event callbacks) from accessing ff while we destroy it.
+	 * This is defense-in-depth since hid_hw_stop() should be called
+	 * before this function, but protects against edge cases.
+	 */
+	WRITE_ONCE(hidpp->private_data, NULL);
+
+	pr_debug("rs50_ff: setting stopping flag\n");
+	/*
+	 * Signal shutdown to prevent new work and allow in-progress work
+	 * to exit early. This must be done first.
+	 * Use release semantics to ensure other CPUs see this before
+	 * subsequent cleanup operations.
+	 */
+	atomic_set_release(&ff->stopping, 1);
+
+	/*
+	 * NOTE: We intentionally do NOT clear ff->input->ff->private here.
+	 * When the USB device is disconnected, interface 0 (which owns the
+	 * input device) may be removed before interface 1 (where our driver
+	 * attaches). If interface 0 is removed first, ff->input points to
+	 * freed memory, and accessing ff->input->ff->private would be a
+	 * use-after-free bug that corrupts the heap.
+	 *
+	 * The FF callbacks (rs50_ff_playback, etc.) already check for NULL
+	 * private data, and we rely on the stopping flag + hid_hw_stop()
+	 * having been called to prevent races during shutdown.
+	 */
+
+	/*
+	 * Clear cross-interface pointers using WRITE_ONCE so timer callback
+	 * and other contexts see the NULL and exit safely. This reduces the
+	 * race window if sibling interfaces are removed before this one.
+	 */
+	WRITE_ONCE(ff->input, NULL);
+	WRITE_ONCE(ff->ff_hdev, NULL);
+
+	pr_debug("rs50_ff: cancelling refresh timer\n");
+	/*
+	 * Cancel the periodic refresh timer first.
+	 */
+	cancel_delayed_work_sync(&ff->refresh_work);
+
+	pr_debug("rs50_ff: cancelling effect timer\n");
+	/*
+	 * Cancel the condition effect timer.
+	 */
+	timer_delete_sync(&ff->effect_timer);
+
+	pr_debug("rs50_ff: cancelling deferred init work\n");
+	/*
+	 * Cancel deferred init if it hasn't run yet.
+	 * cancel_delayed_work_sync will wait if the work is currently running.
+	 */
+	cancel_delayed_work_sync(&ff->init_work);
+
+	pr_debug("rs50_ff: draining workqueue\n");
+	/*
+	 * Drain the workqueue - this waits for all pending work to complete
+	 * and prevents new work from being queued. More robust than manual polling.
+	 */
+	drain_workqueue(ff->wq);
+
+	pr_debug("rs50_ff: removing sysfs attributes\n");
+	/* Remove sysfs attributes */
+	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_range);
+	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_strength);
+	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_damping);
+	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_trueforce);
+	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_brake_force);
+	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_ffb_filter);
+	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_ffb_filter_auto);
+	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_led_effect);
+	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_led_brightness);
+	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_combined_pedals);
+	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_throttle_curve);
+	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_brake_curve);
+	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_clutch_curve);
+	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_throttle_deadzone);
+	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_brake_deadzone);
+	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_clutch_deadzone);
+	/* Remove Oversteer-compatible attributes */
+	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_compat_range);
+	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_compat_gain);
+	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_compat_autocenter);
+	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_compat_damper_level);
+	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_compat_combine_pedals);
+
+	pr_debug("rs50_ff: destroying workqueue\n");
+	/*
+	 * Now safe to destroy workqueue.
+	 */
+	destroy_workqueue(ff->wq);
+
+	/*
+	 * Close HID device if we opened it during init_work.
+	 * This balances the hid_hw_open() call that keeps the interrupt
+	 * IN endpoint active for runtime HID++ communication.
+	 */
+	if (ff->hid_open) {
+		pr_debug("rs50_ff: closing HID device\n");
+		hid_hw_close(hidpp->hid_dev);
+		ff->hid_open = false;
+	}
+
+	pr_debug("rs50_ff: freeing resources\n");
+	/* Clear pointers to prevent use-after-free */
+	ff->ff_hdev = NULL;
+
+	kfree(ff);
+	/* Note: hidpp->private_data was cleared at function start */
+
+	hid_info(hidpp->hid_dev, "RS50 force feedback unloaded\n");
+	pr_debug("rs50_ff: rs50_ff_destroy completed\n");
 }
 
 /* -------------------------------------------------------------------------- */
@@ -3721,17 +6173,16 @@ static int hidpp_initialize_hires_scroll(struct hidpp_device *hidpp)
 
 	if (hidpp->protocol_major >= 2) {
 		u8 feature_index;
-		u8 feature_type;
 
 		ret = hidpp_root_get_feature(hidpp, HIDPP_PAGE_HIRES_WHEEL,
-					     &feature_index, &feature_type);
+					     &feature_index);
 		if (!ret) {
 			hidpp->capabilities |= HIDPP_CAPABILITY_HIDPP20_HI_RES_WHEEL;
 			hid_dbg(hidpp->hid_dev, "Detected HID++ 2.0 hi-res scroll wheel\n");
 			return 0;
 		}
 		ret = hidpp_root_get_feature(hidpp, HIDPP_PAGE_HI_RESOLUTION_SCROLLING,
-					     &feature_index, &feature_type);
+					     &feature_index);
 		if (!ret) {
 			hidpp->capabilities |= HIDPP_CAPABILITY_HIDPP20_HI_RES_SCROLL;
 			hid_dbg(hidpp->hid_dev, "Detected HID++ 2.0 hi-res scrolling\n");
@@ -3753,8 +6204,8 @@ static int hidpp_initialize_hires_scroll(struct hidpp_device *hidpp)
 /* Generic HID++ devices                                                      */
 /* -------------------------------------------------------------------------- */
 
-static u8 *hidpp_report_fixup(struct hid_device *hdev, u8 *rdesc,
-			      unsigned int *rsize)
+static const u8 *hidpp_report_fixup(struct hid_device *hdev, u8 *rdesc,
+				    unsigned int *rsize)
 {
 	struct hidpp_device *hidpp = hid_get_drvdata(hdev);
 
@@ -3787,18 +6238,10 @@ static int hidpp_input_mapping(struct hid_device *hdev, struct hid_input *hi,
 	if (hdev->product == DINOVO_MINI_PRODUCT_ID)
 		return lg_dinovo_input_mapping(hdev, hi, field, usage, bit, max);
 
-	return 0;
-}
+	/* RS50 racing wheel - filter out phantom buttons */
+	if (hdev->product == USB_DEVICE_ID_LOGITECH_RS50)
+		return rs50_input_mapping(hdev, hi, field, usage, bit, max);
 
-static int hidpp_input_setup_wheel(struct hid_device *hdev, struct hid_field *field, 
-		struct hid_usage *usage) 
-{
-	hid_info(hdev, "Setup multiaxis on the wheel");
-	if (usage->type == EV_ABS && (usage->code == ABS_X ||
-				usage->code == ABS_Y || usage->code == ABS_Z ||
-				usage->code == ABS_RZ)) {
-		field->application = HID_GD_MULTIAXIS;
-	}
 	return 0;
 }
 
@@ -3808,21 +6251,16 @@ static int hidpp_input_mapped(struct hid_device *hdev, struct hid_input *hi,
 {
 	struct hidpp_device *hidpp = hid_get_drvdata(hdev);
 
-	/* Input interface on G Pro Xbox and G Pro in G923 compatibility mode
-	 * is different from HIDPP interface, and we do not have information
-	 * about hidpp quirks here
-	*/
-	if (hdev->product == USB_DEVICE_ID_LOGITECH_G_PRO_XBOX_WHEEL ||
-		hdev->product == USB_DEVICE_ID_LOGITECH_G923_XBOX_WHEEL) {
-		hidpp_input_setup_wheel(hdev, field, usage);
-	}
-	
 	if (!hidpp)
 		return 0;
 
 	/* Ensure that Logitech G920 is not given a default fuzz/flat value */
 	if (hidpp->quirks & HIDPP_QUIRK_CLASS_G920) {
-		hidpp_input_setup_wheel(hdev, field, usage);
+		if (usage->type == EV_ABS && (usage->code == ABS_X ||
+				usage->code == ABS_Y || usage->code == ABS_Z ||
+				usage->code == ABS_RZ)) {
+			field->application = HID_GD_MULTIAXIS;
+		}
 	}
 
 	return 0;
@@ -3857,6 +6295,10 @@ static int hidpp_input_configured(struct hid_device *hdev,
 
 	hidpp_populate_input(hidpp, input);
 
+	/* Set up RS50 D-pad as hat switch */
+	if (hidpp->quirks & HIDPP_QUIRK_RS50_FFB)
+		rs50_setup_dpad(input);
+
 	return 0;
 }
 
@@ -3867,6 +6309,7 @@ static int hidpp_raw_hidpp_event(struct hidpp_device *hidpp, u8 *data,
 	struct hidpp_report *answer = hidpp->send_receive_buf;
 	struct hidpp_report *report = (struct hidpp_report *)data;
 	int ret;
+	int last_online;
 
 	/*
 	 * If the mutex is locked then we have a pending answer from a
@@ -3893,8 +6336,6 @@ static int hidpp_raw_hidpp_event(struct hidpp_device *hidpp, u8 *data,
 	}
 
 	if (unlikely(hidpp_report_is_connect_event(hidpp, report))) {
-		atomic_set(&hidpp->connected,
-				!(report->rap.params[0] & (1 << 6)));
 		if (schedule_work(&hidpp->work) == 0)
 			dbg_hid("%s: connect event already queued\n", __func__);
 		return 1;
@@ -3910,6 +6351,7 @@ static int hidpp_raw_hidpp_event(struct hidpp_device *hidpp, u8 *data,
 			"See: https://gitlab.freedesktop.org/jwrdegoede/logitech-27mhz-keyboard-encryption-setup/\n");
 	}
 
+	last_online = hidpp->battery.online;
 	if (hidpp->capabilities & HIDPP_CAPABILITY_HIDPP20_BATTERY) {
 		ret = hidpp20_battery_event_1000(hidpp, data, size);
 		if (ret != 0)
@@ -3932,6 +6374,11 @@ static int hidpp_raw_hidpp_event(struct hidpp_device *hidpp, u8 *data,
 		ret = hidpp10_battery_event(hidpp, data, size);
 		if (ret != 0)
 			return ret;
+	}
+
+	if (hidpp->quirks & HIDPP_QUIRK_RESET_HI_RES_SCROLL) {
+		if (last_online == 0 && hidpp->battery.online == 1)
+			schedule_work(&hidpp->reset_hi_res_work);
 	}
 
 	if (hidpp->quirks & HIDPP_QUIRK_HIDPP_WHEELS) {
@@ -4002,7 +6449,272 @@ static int hidpp_raw_event(struct hid_device *hdev, struct hid_report *report,
 	else if (hidpp->quirks & HIDPP_QUIRK_CLASS_M560)
 		return m560_raw_event(hdev, data, size);
 
+	/*
+	 * Process RS50 joystick reports for D-pad and pedal handling.
+	 * Only process 30-byte reports from interface 0 (joystick).
+	 * This prevents spurious input events from HID++ or FFB reports.
+	 */
+	if ((hidpp->quirks & HIDPP_QUIRK_RS50_FFB) &&
+	    size == RS50_INPUT_REPORT_SIZE &&
+	    data[0] != REPORT_ID_HIDPP_SHORT &&
+	    data[0] != REPORT_ID_HIDPP_LONG &&
+	    data[0] != REPORT_ID_HIDPP_VERY_LONG) {
+		rs50_process_dpad(hidpp, data, size);
+		/* Process pedals: curves, deadzones, combined mode */
+		rs50_process_pedals(hidpp, data, size);
+	}
+
 	return 0;
+}
+
+/*
+ * RS50 D-pad input mapping.
+ * The RS50 uses a custom D-pad encoding in byte 0:
+ * - Bit 3 (0x08) = baseline, normally set, cleared when D-pad pressed
+ * - Bits 0-2 = direction when baseline cleared:
+ *   0x00 = Right, 0x01 = Up-Right, 0x02 = Left, 0x03 = Up-Left
+ *   0x04 = Up, 0x05 = Down-Right, 0x06 = Down, 0x07 = Down-Left
+ *
+ * This function is called from input_configured to set up proper D-pad axes.
+ */
+static void rs50_setup_dpad(struct input_dev *input)
+{
+	/* Set up D-pad as a hat switch (ABS_HAT0X, ABS_HAT0Y) */
+	input_set_abs_params(input, ABS_HAT0X, -1, 1, 0, 0);
+	input_set_abs_params(input, ABS_HAT0Y, -1, 1, 0, 0);
+}
+
+/*
+ * Process RS50 joystick input report and generate proper D-pad events.
+ * Returns 1 if D-pad was processed, 0 otherwise.
+ */
+static int rs50_process_dpad(struct hidpp_device *hidpp, u8 *data, int size)
+{
+	struct rs50_ff_data *ff;
+	struct input_dev *input;
+	u8 byte0;
+	int dpad_x = 0, dpad_y = 0;
+
+	if (!hidpp || !(hidpp->quirks & HIDPP_QUIRK_RS50_FFB))
+		return 0;
+
+	ff = hidpp->private_data;
+	if (!ff || !ff->input)
+		return 0;
+
+	/* Don't process during shutdown */
+	if (atomic_read_acquire(&ff->stopping))
+		return 0;
+
+	input = ff->input;
+
+	/* Check if this is a joystick report (should be 30 bytes from interface 0) */
+	if (size < 4)
+		return 0;
+
+	byte0 = data[0];
+
+	/* Check if D-pad is pressed (baseline bit cleared) */
+	if (byte0 & RS50_DPAD_RELEASED) {
+		/* D-pad released - center position */
+		dpad_x = 0;
+		dpad_y = 0;
+	} else {
+		/* D-pad pressed - decode direction from bits 0-2 */
+		u8 direction = byte0 & RS50_DPAD_DIR_MASK;
+
+		switch (direction) {
+		case RS50_DPAD_RIGHT:
+			dpad_x = 1; dpad_y = 0;
+			break;
+		case RS50_DPAD_UP_RIGHT:
+			dpad_x = 1; dpad_y = -1;
+			break;
+		case RS50_DPAD_LEFT:
+			dpad_x = -1; dpad_y = 0;
+			break;
+		case RS50_DPAD_UP_LEFT:
+			dpad_x = -1; dpad_y = -1;
+			break;
+		case RS50_DPAD_UP:
+			dpad_x = 0; dpad_y = -1;
+			break;
+		case RS50_DPAD_DOWN_RIGHT:
+			dpad_x = 1; dpad_y = 1;
+			break;
+		case RS50_DPAD_DOWN:
+			dpad_x = 0; dpad_y = 1;
+			break;
+		case RS50_DPAD_DOWN_LEFT:
+			dpad_x = -1; dpad_y = 1;
+			break;
+		}
+	}
+
+	/* Only report if changed (use per-device state, not static) */
+	if (dpad_x != ff->last_dpad_x || dpad_y != ff->last_dpad_y) {
+		input_report_abs(input, ABS_HAT0X, dpad_x);
+		input_report_abs(input, ABS_HAT0Y, dpad_y);
+		input_sync(input);
+		ff->last_dpad_x = dpad_x;
+		ff->last_dpad_y = dpad_y;
+	}
+
+	return 0; /* Don't consume the event, let other processing continue */
+}
+
+/*
+ * Apply response curve transformation to a pedal value.
+ * Input/output range: 0x0000 - 0xFFFF
+ *
+ * Curves:
+ * - LINEAR: output = input (1:1 mapping)
+ * - LOW_SENS: output = input^2 / 65535 (less sensitive at start, more at end)
+ * - HIGH_SENS: output = sqrt(input * 65535) (more sensitive at start, less at end)
+ */
+static u16 rs50_apply_curve(u16 input, u8 curve_type)
+{
+	u64 val;
+
+	switch (curve_type) {
+	case RS50_CURVE_LOW_SENS:
+		/* Quadratic curve: less responsive at start
+		 * Use u64 to prevent overflow: 65535 * 65535 = 4,294,836,225
+		 * which is close to u32 limit.
+		 */
+		val = ((u64)input * (u64)input) / 65535;
+		return (u16)val;
+
+	case RS50_CURVE_HIGH_SENS:
+		/* Square root curve: more responsive at start
+		 * Use u64 for safety in intermediate calculation.
+		 */
+		val = (u64)input * 65535;
+		return (u16)int_sqrt(val);
+
+	case RS50_CURVE_LINEAR:
+	default:
+		return input;
+	}
+}
+
+/*
+ * Apply deadzone to a pedal value.
+ * Lower deadzone: values below this threshold are zeroed
+ * Upper deadzone: values above (100 - upper)% are maxed out
+ * The range between deadzones is scaled to full 0-65535 range.
+ */
+static u16 rs50_apply_deadzone(u16 input, u8 lower_pct, u8 upper_pct)
+{
+	u32 lower_threshold, upper_threshold;
+	u32 effective_range;
+	u32 val;
+
+	/* Convert percentages to threshold values */
+	lower_threshold = ((u32)lower_pct * 65535) / 100;
+	upper_threshold = 65535 - (((u32)upper_pct * 65535) / 100);
+
+	/* Clamp and scale */
+	if (input <= lower_threshold)
+		return 0;
+	if (input >= upper_threshold)
+		return 65535;
+
+	/* Scale the value between the deadzones to full range */
+	effective_range = upper_threshold - lower_threshold;
+	if (effective_range == 0)
+		return 65535;
+
+	val = ((u32)(input - lower_threshold) * 65535) / effective_range;
+	return (u16)min(val, (u32)65535);
+}
+
+/*
+ * Process RS50 pedal values: apply response curves, deadzones, and combined mode.
+ * This function modifies the raw HID data in place before the HID subsystem
+ * processes it.
+ *
+ * Joystick report format (30 bytes, offset 4+):
+ *   Offset 4-5: Wheel position (u16 LE)
+ *   Offset 6-7: Accelerator/Throttle (u16 LE)
+ *   Offset 8-9: Brake (u16 LE)
+ *   Offset 10-11: Clutch (u16 LE)
+ */
+static void rs50_process_pedals(struct hidpp_device *hidpp, u8 *data, int size)
+{
+	struct rs50_ff_data *ff;
+	u16 throttle, brake, clutch;
+	u16 combined;
+
+	if (!hidpp || !(hidpp->quirks & HIDPP_QUIRK_RS50_FFB))
+		return;
+
+	ff = hidpp->private_data;
+	if (!ff)
+		return;
+
+	/* Don't process during shutdown */
+	if (atomic_read_acquire(&ff->stopping))
+		return;
+
+	/* Need at least 12 bytes for all pedal data */
+	if (size < 12)
+		return;
+
+	/* Read current pedal values (little-endian) */
+	throttle = get_unaligned_le16(&data[6]);
+	brake = get_unaligned_le16(&data[8]);
+	clutch = get_unaligned_le16(&data[10]);
+
+	/*
+	 * Apply deadzones first (before curve transformation).
+	 * Use READ_ONCE for settings that may be changed from sysfs context
+	 * while we're processing in interrupt/atomic context.
+	 */
+	throttle = rs50_apply_deadzone(throttle,
+				       READ_ONCE(ff->throttle_deadzone_lower),
+				       READ_ONCE(ff->throttle_deadzone_upper));
+	brake = rs50_apply_deadzone(brake,
+				    READ_ONCE(ff->brake_deadzone_lower),
+				    READ_ONCE(ff->brake_deadzone_upper));
+	clutch = rs50_apply_deadzone(clutch,
+				     READ_ONCE(ff->clutch_deadzone_lower),
+				     READ_ONCE(ff->clutch_deadzone_upper));
+
+	/* Apply response curves */
+	throttle = rs50_apply_curve(throttle, READ_ONCE(ff->throttle_curve));
+	brake = rs50_apply_curve(brake, READ_ONCE(ff->brake_curve));
+	clutch = rs50_apply_curve(clutch, READ_ONCE(ff->clutch_curve));
+
+	/* Combined pedals mode: output = throttle - brake on throttle axis */
+	if (READ_ONCE(ff->combined_pedals)) {
+		s32 combined_s;
+
+		/*
+		 * Combined mode calculation:
+		 * - Full throttle, no brake: 65535 (full forward)
+		 * - No throttle, full brake: 0 (full reverse/brake)
+		 * - Both released: 32768 (center/neutral, 0x8000)
+		 * - Both fully pressed: 32768 (neutral)
+		 *
+		 * Formula: combined = (throttle - brake + 65536) / 2
+		 * Using 65536 ensures neutral is exactly 0x8000 (32768).
+		 */
+		combined_s = ((s32)throttle - (s32)brake + 65536) / 2;
+		combined = (u16)clamp(combined_s, (s32)0, (s32)65535);
+
+		/* Write combined value to throttle position */
+		put_unaligned_le16(combined, &data[6]);
+		/* Zero out brake (or set to center if games expect it) */
+		put_unaligned_le16(0, &data[8]);
+	} else {
+		/* Normal mode: write back transformed values */
+		put_unaligned_le16(throttle, &data[6]);
+		put_unaligned_le16(brake, &data[8]);
+	}
+
+	/* Always write back clutch */
+	put_unaligned_le16(clutch, &data[10]);
 }
 
 static int hidpp_event(struct hid_device *hdev, struct hid_field *field,
@@ -4130,24 +6842,22 @@ static int hidpp_initialize_battery(struct hidpp_device *hidpp)
 	return ret;
 }
 
-static void hidpp_overwrite_name(struct hid_device *hdev)
+/* Get name + serial for USB and Bluetooth HID++ devices */
+static void hidpp_non_unifying_init(struct hidpp_device *hidpp)
 {
-	struct hidpp_device *hidpp = hid_get_drvdata(hdev);
+	struct hid_device *hdev = hidpp->hid_dev;
 	char *name;
 
-	if (hidpp->protocol_major < 2)
-		return;
+	/* Bluetooth devices already have their serialnr set */
+	if (hid_is_usb(hdev))
+		hidpp_serial_init(hidpp);
 
 	name = hidpp_get_device_name(hidpp);
-
-	if (!name) {
-		hid_err(hdev, "unable to retrieve the name of the device");
-	} else {
+	if (name) {
 		dbg_hid("HID++: Got name: %s\n", name);
 		snprintf(hdev->name, sizeof(hdev->name), "%s", name);
+		kfree(name);
 	}
-
-	kfree(name);
 }
 
 static int hidpp_input_open(struct input_dev *dev)
@@ -4188,15 +6898,18 @@ static struct input_dev *hidpp_allocate_input(struct hid_device *hdev)
 	return input_dev;
 }
 
-static void hidpp_connect_event(struct hidpp_device *hidpp)
+static void hidpp_connect_event(struct work_struct *work)
 {
+	struct hidpp_device *hidpp = container_of(work, struct hidpp_device, work);
 	struct hid_device *hdev = hidpp->hid_dev;
-	int ret = 0;
-	bool connected = atomic_read(&hidpp->connected);
 	struct input_dev *input;
 	char *name, *devm_name;
+	int ret;
 
-	if (!connected) {
+	/* Get device version to check if it is connected */
+	ret = hidpp_root_get_protocol_version(hidpp);
+	if (ret) {
+		hid_dbg(hidpp->hid_dev, "Disconnected\n");
 		if (hidpp->battery.ps) {
 			hidpp->battery.online = false;
 			hidpp->battery.status = POWER_SUPPLY_STATUS_UNKNOWN;
@@ -4207,15 +6920,15 @@ static void hidpp_connect_event(struct hidpp_device *hidpp)
 	}
 
 	if (hidpp->quirks & HIDPP_QUIRK_CLASS_WTP) {
-		ret = wtp_connect(hdev, connected);
+		ret = wtp_connect(hdev);
 		if (ret)
 			return;
 	} else if (hidpp->quirks & HIDPP_QUIRK_CLASS_M560) {
-		ret = m560_send_config_command(hdev, connected);
+		ret = m560_send_config_command(hdev);
 		if (ret)
 			return;
 	} else if (hidpp->quirks & HIDPP_QUIRK_CLASS_K400) {
-		ret = k400_connect(hdev, connected);
+		ret = k400_connect(hdev);
 		if (ret)
 			return;
 	}
@@ -4238,14 +6951,11 @@ static void hidpp_connect_event(struct hidpp_device *hidpp)
 			return;
 	}
 
-	/* the device is already connected, we can ask for its name and
-	 * protocol */
-	if (!hidpp->protocol_major) {
-		ret = hidpp_root_get_protocol_version(hidpp);
-		if (ret) {
-			hid_err(hdev, "Can not get the protocol version.\n");
-			return;
-		}
+	if (hidpp->protocol_major >= 2) {
+		u8 feature_index;
+
+		if (!hidpp_get_wireless_feature_index(hidpp, &feature_index))
+			hidpp->wireless_feature_index = feature_index;
 	}
 
 	if (hidpp->name == hdev->name && hidpp->protocol_major >= 2) {
@@ -4307,6 +7017,13 @@ static void hidpp_connect_event(struct hidpp_device *hidpp)
 	}
 
 	hidpp->delayed_input = input;
+}
+
+static void hidpp_reset_hi_res_handler(struct work_struct *work)
+{
+	struct hidpp_device *hidpp = container_of(work, struct hidpp_device, reset_hi_res_work);
+
+	hi_res_scroll_enable(hidpp);
 }
 
 static DEVICE_ATTR(builtin_power_supply, 0000, NULL, NULL);
@@ -4390,10 +7107,7 @@ static int hidpp_probe(struct hid_device *hdev, const struct hid_device_id *id)
 {
 	struct hidpp_device *hidpp;
 	int ret;
-	bool connected;
 	unsigned int connect_mask = HID_CONNECT_DEFAULT;
-	struct hidpp_ff_private_data data;
-	bool will_restart = false;
 
 	/* report_fixup needs drvdata to be set before we call hid_parse */
 	hidpp = devm_kzalloc(&hdev->dev, sizeof(*hidpp), GFP_KERNEL);
@@ -4422,9 +7136,6 @@ static int hidpp_probe(struct hid_device *hdev, const struct hid_device_id *id)
 		return hid_hw_start(hdev, HID_CONNECT_DEFAULT);
 	}
 
-	if (id->group == HID_GROUP_LOGITECH_DJ_DEVICE)
-		hidpp->quirks |= HIDPP_QUIRK_UNIFYING;
-
 	if (id->group == HID_GROUP_LOGITECH_27MHZ_DEVICE &&
 	    hidpp_application_equals(hdev, HID_GD_MOUSE))
 		hidpp->quirks |= HIDPP_QUIRK_HIDPP_WHEELS |
@@ -4444,11 +7155,8 @@ static int hidpp_probe(struct hid_device *hdev, const struct hid_device_id *id)
 			return ret;
 	}
 
-	if (hidpp->quirks & HIDPP_QUIRK_DELAYED_INIT ||
-	    hidpp->quirks & HIDPP_QUIRK_UNIFYING)
-		will_restart = true;
-
-	INIT_WORK(&hidpp->work, delayed_work_cb);
+	INIT_WORK(&hidpp->work, hidpp_connect_event);
+	INIT_WORK(&hidpp->reset_hi_res_work, hidpp_reset_hi_res_handler);
 	mutex_init(&hidpp->send_mutex);
 	init_waitqueue_head(&hidpp->wait);
 
@@ -4459,10 +7167,12 @@ static int hidpp_probe(struct hid_device *hdev, const struct hid_device_id *id)
 			 hdev->name);
 
 	/*
-	 * Plain USB connections need to actually call start and open
-	 * on the transport driver to allow incoming data.
+	 * First call hid_hw_start(hdev, 0) to allow IO without connecting any
+	 * hid subdrivers (hid-input, hidraw). This allows retrieving the dev's
+	 * name and serial number and store these in hdev->name and hdev->uniq,
+	 * before the hid-input and hidraw drivers expose these to userspace.
 	 */
-	ret = hid_hw_start(hdev, will_restart ? 0 : connect_mask);
+	ret = hid_hw_start(hdev, 0);
 	if (ret) {
 		hid_err(hdev, "hw start failed\n");
 		goto hid_hw_start_fail;
@@ -4478,69 +7188,57 @@ static int hidpp_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	/* Allow incoming packets */
 	hid_device_io_start(hdev);
 
-	if (hidpp->quirks & HIDPP_QUIRK_UNIFYING)
+	/* Get name + serial, store in hdev->name + hdev->uniq */
+	if (id->group == HID_GROUP_LOGITECH_DJ_DEVICE)
 		hidpp_unifying_init(hidpp);
-	else if (hid_is_usb(hidpp->hid_dev))
-		hidpp_serial_init(hidpp);
+	else
+		hidpp_non_unifying_init(hidpp);
 
-	connected = hidpp_root_get_protocol_version(hidpp) == 0;
-	atomic_set(&hidpp->connected, connected);
-	if (!(hidpp->quirks & HIDPP_QUIRK_UNIFYING)) {
-		if (!connected) {
-			ret = -ENODEV;
-			hid_err(hdev, "Device not connected");
-			goto hid_hw_init_fail;
-		}
+	if (hidpp->quirks & HIDPP_QUIRK_DELAYED_INIT)
+		connect_mask &= ~HID_CONNECT_HIDINPUT;
 
-		hidpp_overwrite_name(hdev);
+	/* Now export the actual inputs and hidraw nodes to the world */
+	hid_device_io_stop(hdev);
+	ret = hid_connect(hdev, connect_mask);
+	if (ret) {
+		hid_err(hdev, "%s:hid_connect returned error %d\n", __func__, ret);
+		goto hid_hw_init_fail;
 	}
 
-	if (connected && hidpp->protocol_major >= 2) {
-		ret = hidpp_set_wireless_feature_index(hidpp);
-		if (ret == -ENOENT)
-			hidpp->wireless_feature_index = 0;
-		else if (ret)
-			goto hid_hw_init_fail;
-		ret = 0;
-	}
-
-	if (connected && (hidpp->quirks & HIDPP_QUIRK_CLASS_WTP)) {
-		ret = wtp_get_config(hidpp);
-		if (ret)
-			goto hid_hw_init_fail;
-	} else if (connected && (hidpp->quirks & HIDPP_QUIRK_CLASS_G920)) {
-		ret = g920_get_config(hidpp, &data);
-		if (ret)
-			goto hid_hw_init_fail;
-	}
-
-	hidpp_connect_event(hidpp);
-
-	if (will_restart) {
-		/* Reset the HID node state */
-		hid_device_io_stop(hdev);
-		hid_hw_close(hdev);
-		hid_hw_stop(hdev);
-
-		if (hidpp->quirks & HIDPP_QUIRK_DELAYED_INIT)
-			connect_mask &= ~HID_CONNECT_HIDINPUT;
-
-		/* Now export the actual inputs and hidraw nodes to the world */
-		ret = hid_hw_start(hdev, connect_mask);
-		if (ret) {
-			hid_err(hdev, "%s:hid_hw_start returned error\n", __func__);
-			goto hid_hw_start_fail;
-		}
-	}
+	/* Check for connected devices now that incoming packets will not be disabled again */
+	hid_device_io_start(hdev);
+	schedule_work(&hidpp->work);
+	flush_work(&hidpp->work);
 
 	if (hidpp->quirks & HIDPP_QUIRK_CLASS_G920) {
-		ret = hidpp_ff_init(hidpp, &data);
-		if (ret)
-			hid_warn(hidpp->hid_dev,
-		     "Unable to initialize force feedback support, errno %d\n",
-				 ret);
+		if (hidpp->quirks & HIDPP_QUIRK_RS50_FFB) {
+			/*
+			 * RS50 uses dedicated endpoint FFB, not HID++ feature 0x8123.
+			 * Skip G920 config and use RS50-specific initialization.
+			 */
+			ret = rs50_ff_init(hidpp);
+			if (ret)
+				hid_warn(hidpp->hid_dev,
+					 "RS50 FFB init failed, errno %d\n", ret);
+		} else {
+			struct hidpp_ff_private_data data;
+
+			ret = g920_get_config(hidpp, &data);
+			if (!ret)
+				ret = hidpp_ff_init(hidpp, &data);
+
+			if (ret)
+				hid_warn(hidpp->hid_dev,
+					 "Unable to initialize force feedback support, errno %d\n",
+					 ret);
+		}
 	}
 
+	/*
+	 * This relies on logi_dj_ll_close() being a no-op so that DJ connection
+	 * events will still be received.
+	 */
+	hid_hw_close(hdev);
 	return ret;
 
 hid_hw_init_fail:
@@ -4561,10 +7259,22 @@ static void hidpp_remove(struct hid_device *hdev)
 	if (!hidpp)
 		return hid_hw_stop(hdev);
 
+	/*
+	 * Stop hardware FIRST to prevent raw_event callbacks from accessing
+	 * private_data while we're freeing it. This fixes a critical race
+	 * where input reports could arrive after kfree(ff) but before
+	 * hid_hw_stop completes.
+	 */
+	hid_hw_stop(hdev);
+
+	/* Now safe to clean up RS50 force feedback - no more callbacks */
+	if (hidpp->quirks & HIDPP_QUIRK_RS50_FFB)
+		rs50_ff_destroy(hidpp);
+
 	sysfs_remove_group(&hdev->dev.kobj, &ps_attribute_group);
 
-	hid_hw_stop(hdev);
 	cancel_work_sync(&hidpp->work);
+	cancel_work_sync(&hidpp->reset_hi_res_work);
 	mutex_destroy(&hidpp->send_mutex);
 }
 
@@ -4612,6 +7322,9 @@ static const struct hid_device_id hidpp_devices[] = {
 	{ /* Keyboard MX5500 (Bluetooth-receiver in HID proxy mode) */
 	  LDJ_DEVICE(0xb30b),
 	  .driver_data = HIDPP_QUIRK_HIDPP_CONSUMER_VENDOR_KEYS },
+	{ /* Logitech G502 Lightspeed Wireless Gaming Mouse */
+	  LDJ_DEVICE(0x407f),
+	  .driver_data = HIDPP_QUIRK_RESET_HI_RES_SCROLL },
 
 	{ LDJ_DEVICE(HID_ANY_ID) },
 
@@ -4642,6 +7355,12 @@ static const struct hid_device_id hidpp_devices[] = {
 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC081) },
 	{ /* Logitech G903 Gaming Mouse over USB */
 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC086) },
+	{ /* Logitech G Pro Gaming Mouse over USB */
+	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC088) },
+	{ /* MX Vertical over USB */
+	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC08A) },
+	{ /* Logitech G703 Hero Gaming Mouse over USB */
+	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC090) },
 	{ /* Logitech G903 Hero Gaming Mouse over USB */
 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC091) },
 	{ /* Logitech G915 TKL Keyboard over USB */
@@ -4652,11 +7371,15 @@ static const struct hid_device_id hidpp_devices[] = {
 	{ /* Logitech G923 Wheel (Xbox version) over USB */
 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_G923_XBOX_WHEEL),
 		.driver_data = HIDPP_QUIRK_CLASS_G920 | HIDPP_QUIRK_FORCE_OUTPUT_REPORTS },
-	{ /* Logitech G PRO Wheel (Xbox version) over USB */
-	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_G_PRO_XBOX_WHEEL),
-		.driver_data = HIDPP_QUIRK_CLASS_G920 },
-	{ /* Logitech G Pro Gaming Mouse over USB */
-	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC088) },
+	{ /* Logitech RS50 Direct Drive Wheel (PlayStation/PC) over USB */
+	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_RS50),
+		.driver_data = HIDPP_QUIRK_CLASS_G920 | HIDPP_QUIRK_RS50_FFB },
+	{ /* Logitech G Pro X Superlight Gaming Mouse over USB */
+	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC094) },
+	{ /* Logitech G Pro X Superlight 2 Gaming Mouse over USB */
+	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC09b) },
+	{ /* Logitech G PRO 2 LIGHTSPEED Wireless Mouse over USB */
+	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xc09a) },
 
 	{ /* G935 Gaming Headset */
 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0x0a87),
@@ -4677,15 +7400,27 @@ static const struct hid_device_id hidpp_devices[] = {
 	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb008) },
 	{ /* MX Master mouse over Bluetooth */
 	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb012) },
+	{ /* M720 Triathlon mouse over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb015) },
+	{ /* MX Master 2S mouse over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb019) },
 	{ /* MX Ergo trackball over Bluetooth */
 	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb01d) },
 	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb01e) },
+	{ /* MX Vertical mouse over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb020) },
 	{ /* Signature M650 over Bluetooth */
 	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb02a) },
 	{ /* MX Master 3 mouse over Bluetooth */
 	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb023) },
+	{ /* MX Anywhere 3 mouse over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb025) },
 	{ /* MX Master 3S mouse over Bluetooth */
 	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb034) },
+	{ /* MX Anywhere 3S mouse over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb037) },
+	{ /* MX Anywhere 3SB mouse over Bluetooth */
+	  HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_LOGITECH, 0xb038) },
 	{}
 };
 

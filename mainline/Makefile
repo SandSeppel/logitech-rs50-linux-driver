@@ -1,0 +1,25 @@
+KVERSION := $(shell uname -r)
+KDIR := /lib/modules/$(KVERSION)/build
+
+# Use clang to match kernel build
+CC := clang
+LLVM := 1
+
+obj-m := hid-logitech-hidpp.o
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) CC=$(CC) LLVM=$(LLVM) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+
+install: all
+	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
+	depmod -a
+
+load: all
+	-sudo rmmod hid-logitech-hidpp 2>/dev/null || true
+	sudo insmod ./hid-logitech-hidpp.ko
+
+unload:
+	-sudo rmmod hid-logitech-hidpp 2>/dev/null || true

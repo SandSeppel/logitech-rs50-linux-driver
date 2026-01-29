@@ -45,8 +45,8 @@
 #define USB_WIRELESS_STATUS_DISCONNECTED 1
 #endif
 
-/* report_fixup callback signature changed from u8* to const u8* in 6.2 */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 2, 0)
+/* report_fixup callback signature changed from u8* to const u8* in 6.12 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
 #define HIDPP_REPORT_FIXUP_RETURN_TYPE u8 *
 #else
 #define HIDPP_REPORT_FIXUP_RETURN_TYPE const u8 *

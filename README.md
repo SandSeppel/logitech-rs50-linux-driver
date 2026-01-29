@@ -67,7 +67,7 @@ This is a patched version of the `hid-logitech-hidpp` driver that adds RS50 supp
 
 ## Requirements
 
-- Linux kernel 6.6+ (tested on 6.12 and 6.18)
+- Linux kernel 5.15+ (tested on 5.15, 6.1, 6.8, 6.12, 6.18)
 - Kernel headers for your running kernel
 - Build tools: `make`, `clang` or `gcc`
 

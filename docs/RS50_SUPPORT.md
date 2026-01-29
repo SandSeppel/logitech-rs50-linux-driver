@@ -100,4 +100,5 @@ fftest /dev/input/eventX
 
 **Current**: Under active development - may contain bugs or incomplete features
 **Features**: Force feedback (constant + condition effects), all buttons, sysfs settings
+**Kernel Compatibility**: Linux 5.15+ (tested on 5.15, 6.1, 6.8, 6.12, 6.18)
 **Date**: 2026-01-29

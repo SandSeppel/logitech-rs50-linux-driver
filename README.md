@@ -169,8 +169,12 @@ echo 900 | sudo tee $RS50_DEV/rs50_range
 # Example: Set FFB strength to 80%
 echo 80 | sudo tee $RS50_DEV/rs50_strength
 
-# Example: Set LED to static effect
-echo 5 | sudo tee $RS50_DEV/rs50_led_effect
+# Example: Set LED slot to CUSTOM 1 (slot 0)
+echo 0 | sudo tee $RS50_DEV/rs50_led_slot
+
+# Example: Set custom rainbow colors for all 10 LEDs (hex RGB triplets)
+echo "ff0000 ff7f00 ffff00 00ff00 00ffff 0000ff 7f00ff ff00ff ff0080 ffffff" | sudo tee $RS50_DEV/rs50_led_colors
+echo 1 | sudo tee $RS50_DEV/rs50_led_apply
 ```
 
 ### Available sysfs Attributes
@@ -184,7 +188,10 @@ echo 5 | sudo tee $RS50_DEV/rs50_led_effect
 | `rs50_brake_force` | 0-100 | Brake pedal load cell threshold |
 | `rs50_ffb_filter` | 1-15 | FFB smoothing level |
 | `rs50_ffb_filter_auto` | 0-1 | Auto FFB filter (0=off, 1=on) |
-| `rs50_led_effect` | 1-5 | LED effect (1-4=animated, 5=static) |
+| `rs50_led_slot` | 0-4 | Active LIGHTSYNC custom slot (CUSTOM 1-5) |
+| `rs50_led_direction` | 0-3 | Animation direction (0=L→R, 1=R→L, 2=In→Out, 3=Out→In) |
+| `rs50_led_colors` | hex | 10 space-separated RGB hex values (LED1-LED10) |
+| `rs50_led_apply` | (write) | Apply current slot config to device |
 | `rs50_led_brightness` | 0-100 | LED brightness percentage |
 | `rs50_combined_pedals` | 0-1 | Combined pedals mode |
 | `rs50_throttle_curve` | 0-2 | Throttle response curve |
@@ -199,9 +206,11 @@ echo 5 | sudo tee $RS50_DEV/rs50_led_effect
 The driver exposes standard wheel attributes for [Oversteer](https://github.com/berarma/oversteer) compatibility:
 - `range` - Rotation range (up to 2700°)
 - `gain` - FFB strength
-- `autocenter` - Autocenter strength (stub)
+- `autocenter` - Autocenter strength (stub - see note below)
 - `combine_pedals` - Combined pedals mode
 - `damper_level` - Damping level
+
+> **Note on autocenter:** The `autocenter` attribute is a stub that stores values locally but doesn't communicate with the device. G Hub doesn't expose an autocenter setting for the RS50, and modern direct-drive wheels don't need hardware centering - games use FF_SPRING effects instead, which the driver fully supports.
 
 **Note:** Oversteer requires a patch for RS50 support. This patch has been submitted upstream; until merged, you can apply it manually.
 

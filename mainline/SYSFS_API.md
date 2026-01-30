@@ -216,6 +216,38 @@ Selects the active custom LED slot for configuration.
 echo 2 > rs50_led_slot
 ```
 
+### rs50_led_slot_name
+**Access**: Read/Write
+**Values**: String (max 8 characters)
+
+Gets or sets the name of the currently selected LED slot. Names are stored on the device.
+
+```bash
+# Read current slot name
+cat rs50_led_slot_name
+# Output: "CUSTOM 1" (or user-defined name)
+
+# Set a custom name for the slot
+echo "Racing" > rs50_led_slot_name
+```
+
+### rs50_led_slot_brightness
+**Access**: Read/Write
+**Values**: `0` to `100` (percentage)
+
+Gets or sets the brightness for the currently selected slot. Each slot can have its own brightness level, which is applied when the slot is activated via `rs50_led_apply`.
+
+```bash
+# Read current slot brightness
+cat rs50_led_slot_brightness
+# Output: brightness percentage (e.g., "75")
+
+# Set slot brightness to 50%
+echo 50 > rs50_led_slot_brightness
+```
+
+**Note**: This is per-slot brightness. Use `rs50_led_brightness` to set global brightness without changing slot settings.
+
 ### rs50_led_direction
 **Access**: Read/Write
 **Values**: `0` to `3`

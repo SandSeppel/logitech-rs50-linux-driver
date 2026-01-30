@@ -3709,7 +3709,8 @@ static int g920_get_config(struct hidpp_device *hidpp,
  */
 #define RS50_RGB_FN_GET_CONFIG		0x10	/* fn1: Get slot config */
 #define RS50_RGB_FN_SET_CONFIG		0x20	/* fn2: Set RGB colors (VERY_LONG) */
-#define RS50_RGB_FN_ACTIVATE		0x30	/* fn3: Activate slot */
+#define RS50_RGB_FN_GET_NAME		0x30	/* fn3: Get slot name (also activates) */
+#define RS50_RGB_FN_ACTIVATE		0x30	/* fn3: Activate slot (same as GET_NAME) */
 #define RS50_RGB_FN_SET_NAME		0x40	/* fn4: Set slot name */
 #define RS50_RGB_FN_PRE_CONFIG		0x60	/* fn6: Pre-config before RGB data */
 #define RS50_RGB_FN_COMMIT		0x70	/* fn7: Commit after RGB data */
@@ -3721,9 +3722,12 @@ static int g920_get_config(struct hidpp_device *hidpp,
 #define RS50_LIGHTSYNC_DIR_OUTSIDE_IN	3	/* Edges inward (contract) */
 
 /* LIGHTSYNC per-slot configuration */
+#define RS50_SLOT_NAME_MAX_LEN	8	/* Max slot name length (from device info) */
+
 struct rs50_lightsync_slot {
 	u8 direction;			/* Direction/animation style (0-3) */
 	u8 brightness;			/* Per-slot brightness (0-100), TODO: Sprint 7 */
+	char name[RS50_SLOT_NAME_MAX_LEN + 1];	/* Slot name + null terminator */
 	u8 colors[RS50_LIGHTSYNC_NUM_LEDS * 3]; /* RGB for each LED (30 bytes) */
 };
 
@@ -4573,6 +4577,8 @@ static int rs50_set_mode(struct rs50_ff_data *ff, u8 profile)
 
 /* Forward declarations for LIGHTSYNC functions */
 static int rs50_lightsync_enable(struct hidpp_device *hidpp, struct rs50_ff_data *ff);
+static void rs50_lightsync_query_slot_names(struct hidpp_device *hidpp,
+					    struct rs50_ff_data *ff);
 static int rs50_lightsync_apply_slot(struct hidpp_device *hidpp,
 				     struct rs50_ff_data *ff, u8 slot);
 
@@ -4693,6 +4699,9 @@ static void rs50_ff_query_settings(struct rs50_ff_data *ff)
 		if (ret) {
 			hid_warn(hid, "RS50: Failed to enable LIGHTSYNC: %d\n", ret);
 		} else {
+			/* Query slot names from device */
+			rs50_lightsync_query_slot_names(hidpp, ff);
+
 			/*
 			 * After enabling, send initial configuration to the device.
 			 * Without this, LEDs are enabled but have no config, staying dark.
@@ -5689,6 +5698,62 @@ static int rs50_lightsync_enable(struct hidpp_device *hidpp, struct rs50_ff_data
 }
 
 /*
+ * Query slot name from device.
+ * fn3 (0x30) on feature 0x0C returns: [slot] [len] [name...]
+ */
+static int rs50_lightsync_get_slot_name(struct hidpp_device *hidpp,
+					struct rs50_ff_data *ff, u8 slot)
+{
+	struct hid_device *hid = hidpp->hid_dev;
+	struct hidpp_report response;
+	u8 params[3];
+	int ret, len;
+
+	if (slot >= RS50_LIGHTSYNC_NUM_SLOTS)
+		return -EINVAL;
+
+	if (ff->idx_rgb_config == RS50_FEATURE_NOT_FOUND)
+		return -EOPNOTSUPP;
+
+	params[0] = slot;
+	params[1] = 0;
+	params[2] = 0;
+
+	ret = hidpp_send_fap_command_sync(hidpp, ff->idx_rgb_config,
+					  RS50_RGB_FN_GET_NAME, params, 3, &response);
+	if (ret) {
+		hid_dbg(hid, "RS50: Failed to get slot %d name: %d\n", slot, ret);
+		return ret;
+	}
+
+	/* Response: [slot] [len] [name...] */
+	len = response.fap.params[1];
+	if (len > RS50_SLOT_NAME_MAX_LEN)
+		len = RS50_SLOT_NAME_MAX_LEN;
+
+	memset(ff->led_slots[slot].name, 0, sizeof(ff->led_slots[slot].name));
+	if (len > 0)
+		memcpy(ff->led_slots[slot].name, &response.fap.params[2], len);
+
+	hid_dbg(hid, "RS50: Slot %d name: \"%s\" (len=%d)\n",
+		slot, ff->led_slots[slot].name, len);
+
+	return 0;
+}
+
+/*
+ * Query all slot names from device.
+ */
+static void rs50_lightsync_query_slot_names(struct hidpp_device *hidpp,
+					    struct rs50_ff_data *ff)
+{
+	int i;
+
+	for (i = 0; i < RS50_LIGHTSYNC_NUM_SLOTS; i++)
+		rs50_lightsync_get_slot_name(hidpp, ff, i);
+}
+
+/*
  * Helper to send LIGHTSYNC config to device.
  * From capture analysis (lightsync_custom_save.pcapng), G Hub sequence is:
  *   1. Set effect mode to 5 (Custom) on feature 0x0B
@@ -5861,6 +5926,24 @@ static int rs50_lightsync_apply_slot(struct hidpp_device *hidpp,
 		hid_info(hid, "RS50: 0x0B fn7(enable) ret=%d\n", ret);
 	}
 
+	/*
+	 * Step 8: Apply per-slot brightness.
+	 * Each custom slot can have its own brightness stored locally.
+	 */
+	if (ff->idx_brightness != RS50_FEATURE_NOT_FOUND) {
+		params[0] = 0x00;
+		params[1] = ls->brightness;
+		params[2] = 0x00;
+
+		ret = hidpp_send_fap_command_sync(hidpp, ff->idx_brightness,
+						  RS50_HIDPP_FN_SET, params, 3, &response);
+		if (ret == 0) {
+			ff->led_brightness = ls->brightness;
+			hid_dbg(hid, "RS50: Slot %d brightness applied: %d%%\n",
+				slot, ls->brightness);
+		}
+	}
+
 	hid_info(hid, "RS50: apply_slot complete\n");
 	return 0;
 }
@@ -5919,6 +6002,166 @@ static ssize_t rs50_led_slot_store(struct device *dev, struct device_attribute *
 }
 
 static DEVICE_ATTR(rs50_led_slot, 0664, rs50_led_slot_show, rs50_led_slot_store);
+
+/* rs50_led_slot_name - read/write name for current slot (max 8 chars) */
+static ssize_t rs50_led_slot_name_show(struct device *dev, struct device_attribute *attr,
+				       char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+	u8 slot;
+
+	if (!hidpp)
+		return -ENODEV;
+	ff = READ_ONCE(hidpp->private_data);
+	if (!ff)
+		return -ENODEV;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	slot = ff->led_active_slot;
+
+	return sysfs_emit(buf, "%s\n", ff->led_slots[slot].name);
+}
+
+static ssize_t rs50_led_slot_name_store(struct device *dev, struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+	struct hidpp_report response;
+	u8 params[16];
+	u8 slot;
+	size_t len;
+	int ret;
+
+	if (!hidpp)
+		return -ENODEV;
+	ff = READ_ONCE(hidpp->private_data);
+	if (!ff)
+		return -ENODEV;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	if (ff->idx_rgb_config == RS50_FEATURE_NOT_FOUND)
+		return -EOPNOTSUPP;
+
+	slot = ff->led_active_slot;
+
+	/* Strip trailing newline */
+	len = count;
+	if (len > 0 && buf[len - 1] == '\n')
+		len--;
+
+	if (len > RS50_SLOT_NAME_MAX_LEN)
+		len = RS50_SLOT_NAME_MAX_LEN;
+
+	/* fn4: SET_NAME - [slot] [len] [name...] */
+	memset(params, 0, sizeof(params));
+	params[0] = slot;
+	params[1] = len;
+	if (len > 0)
+		memcpy(&params[2], buf, len);
+
+	ret = hidpp_send_fap_command_sync(hidpp, ff->idx_rgb_config,
+					  RS50_RGB_FN_SET_NAME, params,
+					  2 + len, &response);
+	if (ret) {
+		hid_err(hid, "RS50: Failed to set slot %d name: %d\n", slot, ret);
+		return ret < 0 ? ret : -EIO;
+	}
+
+	/* Update cached name */
+	memset(ff->led_slots[slot].name, 0, sizeof(ff->led_slots[slot].name));
+	if (len > 0)
+		memcpy(ff->led_slots[slot].name, buf, len);
+
+	hid_info(hid, "RS50: Slot %d name set to \"%s\"\n", slot, ff->led_slots[slot].name);
+	return count;
+}
+
+static DEVICE_ATTR(rs50_led_slot_name, 0664,
+		   rs50_led_slot_name_show, rs50_led_slot_name_store);
+
+/* rs50_led_slot_brightness - per-slot brightness (0-100) */
+static ssize_t rs50_led_slot_brightness_show(struct device *dev,
+					     struct device_attribute *attr,
+					     char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+	u8 slot;
+
+	if (!hidpp)
+		return -ENODEV;
+	ff = READ_ONCE(hidpp->private_data);
+	if (!ff)
+		return -ENODEV;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	slot = ff->led_active_slot;
+
+	return sysfs_emit(buf, "%u\n", ff->led_slots[slot].brightness);
+}
+
+static ssize_t rs50_led_slot_brightness_store(struct device *dev,
+					      struct device_attribute *attr,
+					      const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hidpp_device *hidpp = hid_get_drvdata(hid);
+	struct rs50_ff_data *ff;
+	struct hidpp_report response;
+	u8 params[3];
+	unsigned int brightness;
+	u8 slot;
+	int ret;
+
+	if (!hidpp)
+		return -ENODEV;
+	ff = READ_ONCE(hidpp->private_data);
+	if (!ff)
+		return -ENODEV;
+	if (atomic_read_acquire(&ff->stopping))
+		return -ENODEV;
+
+	ret = kstrtouint(buf, 10, &brightness);
+	if (ret)
+		return ret;
+
+	if (brightness > 100)
+		brightness = 100;
+
+	slot = ff->led_active_slot;
+	ff->led_slots[slot].brightness = brightness;
+
+	/* Apply brightness to device */
+	if (ff->idx_brightness != RS50_FEATURE_NOT_FOUND) {
+		params[0] = 0x00;
+		params[1] = brightness;
+		params[2] = 0x00;
+
+		ret = hidpp_send_fap_command_sync(hidpp, ff->idx_brightness,
+						  RS50_HIDPP_FN_SET, params, 3, &response);
+		if (ret) {
+			hid_err(hid, "RS50: Failed to set slot brightness: %d\n", ret);
+			return ret < 0 ? ret : -EIO;
+		}
+	}
+
+	/* Also update global brightness to match */
+	ff->led_brightness = brightness;
+
+	hid_info(hid, "RS50: Slot %d brightness set to %u%%\n", slot, brightness);
+	return count;
+}
+
+static DEVICE_ATTR(rs50_led_slot_brightness, 0664,
+		   rs50_led_slot_brightness_show, rs50_led_slot_brightness_store);
 
 /* rs50_led_direction - set direction for current slot (0-3) */
 static ssize_t rs50_led_direction_show(struct device *dev, struct device_attribute *attr,
@@ -7045,6 +7288,10 @@ static int rs50_ff_init(struct hidpp_device *hidpp)
 	/* LIGHTSYNC LED control sysfs attributes */
 	if (device_create_file(&hid->dev, &dev_attr_rs50_led_slot))
 		hid_warn(hid, "RS50: LED slot setting unavailable via sysfs\n");
+	if (device_create_file(&hid->dev, &dev_attr_rs50_led_slot_name))
+		hid_warn(hid, "RS50: LED slot name unavailable via sysfs\n");
+	if (device_create_file(&hid->dev, &dev_attr_rs50_led_slot_brightness))
+		hid_warn(hid, "RS50: LED slot brightness unavailable via sysfs\n");
 	if (device_create_file(&hid->dev, &dev_attr_rs50_led_direction))
 		hid_warn(hid, "RS50: LED direction setting unavailable via sysfs\n");
 	if (device_create_file(&hid->dev, &dev_attr_rs50_led_colors))
@@ -7200,6 +7447,8 @@ static void rs50_ff_destroy(struct hidpp_device *hidpp)
 	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_profile);
 	/* LIGHTSYNC LED control attributes */
 	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_led_slot);
+	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_led_slot_name);
+	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_led_slot_brightness);
 	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_led_direction);
 	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_led_colors);
 	device_remove_file(&hidpp->hid_dev->dev, &dev_attr_rs50_led_apply);

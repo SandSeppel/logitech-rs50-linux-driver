@@ -3726,7 +3726,7 @@ static int g920_get_config(struct hidpp_device *hidpp,
 
 struct rs50_lightsync_slot {
 	u8 direction;			/* Direction/animation style (0-3) */
-	u8 brightness;			/* Per-slot brightness (0-100), TODO: Sprint 7 */
+	u8 brightness;			/* Per-slot brightness (0-100) */
 	char name[RS50_SLOT_NAME_MAX_LEN + 1];	/* Slot name + null terminator */
 	u8 colors[RS50_LIGHTSYNC_NUM_LEDS * 3]; /* RGB for each LED (30 bytes) */
 };
@@ -7200,7 +7200,7 @@ static int rs50_ff_init(struct hidpp_device *hidpp)
 		int j;
 
 		ff->led_slots[i].direction = RS50_LIGHTSYNC_DIR_LEFT_RIGHT;
-		ff->led_slots[i].brightness = 100;  /* Default: 100%, TODO: Sprint 7 */
+		ff->led_slots[i].brightness = 100;  /* Default: 100% */
 		for (j = 0; j < RS50_LIGHTSYNC_NUM_LEDS; j++) {
 			/* Default: white (0xFF, 0xFF, 0xFF) for all LEDs */
 			ff->led_slots[i].colors[j * 3 + 0] = 0xFF;

@@ -103,3 +103,58 @@ jobs:
             exit 1
           fi
         continue-on-error: true  # Sparse can be noisy on kernel headers
+
+  smatch:
+    name: Smatch Analysis
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y build-essential linux-headers-generic git \
+            libsqlite3-dev libssl-dev libxml2-dev llvm clang
+
+      - name: Build smatch
+        run: |
+          git clone --depth=1 https://github.com/error27/smatch.git /tmp/smatch
+          cd /tmp/smatch
+          make -j$(nproc)
+          echo "/tmp/smatch/smatch" >> "$GITHUB_PATH"
+
+      - name: Find kernel version
+        id: kernel
+        run: |
+          KVER=$(ls /lib/modules | head -1)
+          echo "version=$KVER" >> "$GITHUB_OUTPUT"
+
+      - name: Run smatch
+        working-directory: mainline
+        env:
+          KVER: ${{ steps.kernel.outputs.version }}
+        run: |
+          # Run smatch via the kernel build system
+          make KDIR="/lib/modules/$KVER/build" \
+            CHECK="/tmp/smatch/smatch -p=kernel" C=2 2>&1 | tee smatch.log
+
+          # Filter to only our file's issues
+          grep "hid-logitech-hidpp.c" smatch.log > smatch_filtered.log || true
+
+          # Display findings
+          if [ -s smatch_filtered.log ]; then
+            echo "=== Smatch findings ==="
+            cat smatch_filtered.log
+          else
+            echo "No smatch issues found in driver code"
+          fi
+
+          # Fail on errors (not warnings)
+          if grep -q "error:" smatch_filtered.log 2>/dev/null; then
+            echo "Smatch found errors"
+            exit 1
+          fi
+        continue-on-error: true  # Smatch can have false positives

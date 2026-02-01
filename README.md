@@ -16,7 +16,9 @@ Linux kernel driver for the **Logitech RS50 Direct Drive Wheel Base** (USB ID `0
 
 This is a patched version of the `hid-logitech-hidpp` driver that adds RS50 support with full force feedback, including condition effects, and exposes all G Hub settings via sysfs for runtime configuration.
 
-**Note:** This driver replaces the in-kernel `hid-logitech-hidpp` module and continues to support all other Logitech HID++ devices (mice, keyboards, other racing wheels like the G29, G920, G923, G Pro, etc.).
+**Note:** This driver replaces the in-kernel `hid-logitech-hidpp` module and continues to support all other Logitech HID++ devices (mice, keyboards, other racing wheels like the G29, G920, G923, etc.).
+
+> **G Pro Racing Wheel Note:** The G Pro (046d:c272) is a direct-drive wheel like the RS50, but its FFB architecture is not yet confirmed. It may use either the standard HID++ Feature 0x8123 (like G920/G923) or dedicated endpoints (like RS50). Without USB protocol captures, we cannot add RS50-style FFB support for it.
 
 ## Features
 
@@ -328,11 +330,22 @@ Games detect the wheel as a standard Linux joystick with FF support. No special 
 ## Technical Details
 
 The RS50 is a multi-interface USB device:
-- Interface 0: Joystick input (30-byte reports)
-- Interface 1: HID++ 4.2 protocol (configuration)
-- Interface 2: Force feedback (64-byte reports on endpoint 0x03)
+- **Interface 0**: Joystick input (30-byte reports) - No HID++ support
+- **Interface 1**: HID++ 4.2 protocol (configuration, settings, feature discovery)
+- **Interface 2**: Force feedback output (64-byte reports on endpoint 0x03)
 
-Unlike the G920/G923 which use HID++ Feature 0x8123 for FFB, the RS50 uses a dedicated endpoint with a custom protocol. See `docs/RS50_PROTOCOL_SPECIFICATION.md` for complete protocol documentation.
+### Architecture Difference: RS50 vs G920/G923
+
+| Aspect | G920/G923 (Belt-driven) | RS50 (Direct-drive) |
+|--------|-------------------------|---------------------|
+| FFB Protocol | HID++ Feature 0x8123 | Dedicated USB endpoint |
+| FFB Commands | Via HID++ FAP messages | Raw HID output reports (05 XX) |
+| Interface Layout | Unified | 3 separate interfaces |
+| Max Rotation | 900° | 2700° |
+
+**Critical Implementation Detail:** The RS50 driver must initialize FFB only on Interface 1 (HID++), not Interface 0 (joystick). Interface 0 lacks HID++ support and attempting FFB initialization there causes joystick input to fail. The driver uses `HIDPP_QUIRK_RS50_FFB` to differentiate from the standard G920 code path.
+
+See `RS50_PROTOCOL_SPECIFICATION.md` for complete protocol documentation.
 
 ## Troubleshooting
 

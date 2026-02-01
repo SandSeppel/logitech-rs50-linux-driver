@@ -99,6 +99,21 @@ fftest /dev/input/eventX
 ## Status
 
 **Current**: Under active development - may contain bugs or incomplete features
-**Features**: Force feedback (constant + condition effects), all buttons, sysfs settings, LIGHTSYNC LED control
+**Features**: Force feedback (constant + condition effects), wheel position tracking, all buttons, sysfs settings, LIGHTSYNC LED control
 **Kernel Compatibility**: Linux 5.15+ (tested on 5.15, 6.1, 6.8, 6.12, 6.18)
-**Date**: 2026-01-30
+**Date**: 2026-02-01
+
+### Recent Fixes
+
+**2026-02-01: Interface Initialization Order**
+- Fixed: Wheel position stuck at -32767 in jstest
+- Cause: FFB was initialized on Interface 0 (joystick, no HID++) instead of Interface 1 (HID++)
+- Solution: Only call `rs50_ff_init()` when `hidpp->supported_reports != 0`
+
+### Architecture Note
+
+The RS50 uses a **fundamentally different FFB architecture** than the G920/G923:
+- G920/G923: FFB via HID++ Feature 0x8123 (FAP messages)
+- RS50: FFB via dedicated USB endpoint with raw HID output reports
+
+This means code for G920 FFB cannot be directly reused for RS50. The driver uses `HIDPP_QUIRK_RS50_FFB` to select the appropriate code path.

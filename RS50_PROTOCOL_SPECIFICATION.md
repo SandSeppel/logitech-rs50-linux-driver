@@ -1,7 +1,7 @@
 # Logitech RS50 Protocol Specification
 
-**Document Version**: 5.5
-**Date**: 2026-01-30 (Updated with mode/profile capture analysis)
+**Document Version**: 5.6
+**Date**: 2026-02-01 (Interface initialization fix, architecture clarification)
 **Author**: Verified from USB capture analysis
 **Status**: Working specification for Linux driver development
 
@@ -662,11 +662,25 @@ echo "3 0" > /sys/class/hidraw/hidraw*/device/rs50_brake_deadzone
 | Feature | G920/G923 | RS50 |
 |---------|-----------|------|
 | FFB Method | HID++ Feature 0x8123 | Dedicated endpoint 0x03 |
+| FFB Commands | Via HID++ FAP messages | Raw HID output reports (05 XX) |
 | Report ID | 0x11/0x12 | 0x01 (custom) |
 | Sequence Field | 2 bytes | 1 byte |
 | Max Rotation | 900° | 2700° |
 | Motor Type | Belt/Gear | Direct drive |
 | FFB Refresh | Not needed | `05 07` periodic |
+| USB Interfaces | Unified HID++ | 3 separate (joystick, HID++, FFB) |
+
+### Architecture Note
+
+The RS50 uses a **fundamentally different FFB architecture** from the G920/G923:
+
+- **G920/G923**: All FFB communication via HID++ Feature 0x8123. The kernel driver queries the feature index at runtime and sends FAP (Feature Access Protocol) messages.
+
+- **RS50**: FFB uses a dedicated USB endpoint (0x03 OUT on Interface 2) with raw HID output reports. HID++ is used only for configuration (rotation range, strength, etc.), not for real-time force commands.
+
+**Driver implication**: Code paths for G920 FFB (`hidpp_ff_*` functions using Feature 0x8123) cannot be reused for RS50. The driver uses `HIDPP_QUIRK_RS50_FFB` to select the dedicated endpoint code path (`rs50_ff_*` functions).
+
+**Interface initialization**: FFB must be initialized on Interface 1 (HID++), not Interface 0 (joystick). See Section 12 "RESOLVED: FFB Initialization on Wrong Interface".
 
 ---
 
@@ -1323,6 +1337,33 @@ if (rdesc[i+4] == 0x29 && rdesc[i+5] == 0x5c)
 
 **Note:** "Invalid code" messages may still appear briefly during manual `rmmod`/`insmod` cycles when hid-generic temporarily binds. This is cosmetic and doesn't affect functionality.
 
+### RESOLVED: FFB Initialization on Wrong Interface (Wheel Position Stuck)
+
+**Problem (fixed 2026-02-01):** Wheel position stuck at -32767 in jstest, hidraw0 received no data.
+
+**Root Cause:** FFB was initialized on Interface 0 (joystick) instead of Interface 1 (HID++):
+1. All RS50 interfaces have `HIDPP_QUIRK_CLASS_G920 | HIDPP_QUIRK_RS50_FFB` quirks
+2. Interface 0 probes FIRST (kernel probe order)
+3. `rs50_ff_init()` was called on Interface 0, which has `supported_reports = 0` (no HID++)
+4. Interface 1 (HID++) probed second, found "FF data already exists", skipped FFB init
+5. Result: FFB data stored on interface without HID++ support; wheel position tracking broken
+
+**Why Interface 0 breaks:** Interface 0 has no HID++ protocol support. When FFB is initialized there, `ff->hidpp` points to an interface that cannot communicate via HID++. Additionally, the joystick input processing was somehow disrupted by the incorrect initialization.
+
+**Solution (implemented):**
+```c
+if (hidpp->quirks & HIDPP_QUIRK_RS50_FFB) {
+    if (hidpp->supported_reports) {  /* Only init on HID++ interfaces */
+        ret = rs50_ff_init(hidpp);
+        ...
+    } else {
+        hid_info(hdev, "RS50: Skipping FFB init on non-HID++ interface\n");
+    }
+}
+```
+
+**Verification:** After fix, dmesg shows FFB init on Interface 0011 (HID++), jstest shows axis 0 changing (50 → 52), FFB timer shows `pos=52` instead of `pos=-32768`.
+
 ### Feature Discovery Sequence (from G Hub)
 
 G Hub uses this sequence to discover features:
@@ -1379,3 +1420,6 @@ This returns the PAGE ID at each index. G Hub queries indices 0x00 through ~0x1F
 | 5.1 | 2026-01-29 | **LIGHTSYNC DEBUG**: Documented investigation findings - Enable function (0x6C) returns error 0x05, G Hub doesn't use it during init. Critical discovery: RGB config commands in captures go to **feature index 0x0C**, not 0x0B. Updated Section 9.3.1 with status clarification. Added Section 9.11 with detailed investigation notes and next steps. |
 | 5.2 | 2026-01-29 | **FEATURE IDENTIFIED**: Confirmed feature at index 0x0C is page **0x807B** from feature enumeration data. Updated Section 9.11 and related docs with this finding. Two LIGHTSYNC features: 0x807A (effect control) and 0x807B (RGB data). |
 | 5.3 | 2026-01-30 | **LIGHTSYNC INVESTIGATION CONTINUED**: Driver updated to use both features correctly (0x0B for effect, 0x0C for RGB). Discovered G Hub calls Profile (0x17) and Sync (0x09/0x1BC0) features before LED changes. Implemented full G Hub sequence in driver. All commands succeed but LEDs still dark. Added cold-start capture procedure to record.bat. Next step: capture G Hub initialization from wheel power-off state. |
+| 5.4 | 2026-01-30 | **LIGHTSYNC WORKING**: Fixed LED initialization - now correctly queries features and applies settings on startup. LEDs illuminate with driver-configured colors. |
+| 5.5 | 2026-01-30 | Updated mode/profile capture analysis, expanded sysfs documentation. |
+| 5.6 | 2026-02-01 | **INTERFACE FIX**: Fixed wheel position tracking (was stuck at -32767). Root cause: FFB initialized on Interface 0 (joystick, no HID++) instead of Interface 1 (HID++). Solution: only call rs50_ff_init() when supported_reports != 0. Added architecture comparison with G920/G923 (they use HID++ Feature 0x8123, RS50 uses dedicated endpoint). |

@@ -3740,7 +3740,7 @@ struct rs50_lightsync_slot {
  * FF_SPRING, FF_DAMPER, FF_FRICTION, and FF_INERTIA ourselves.
  */
 #define RS50_FF_MAX_EFFECTS		16	/* Max simultaneous effects */
-#define RS50_FF_TIMER_INTERVAL_MS	4	/* ~250 Hz update rate */
+#define RS50_FF_TIMER_INTERVAL_MS	10	/* 100 Hz update rate for condition effects */
 
 /*
  * RS50 pedal response curve types.
@@ -3796,6 +3796,7 @@ struct rs50_ff_work {
 /* RS50 FFB private data */
 struct rs50_ff_data {
 	struct hidpp_device *hidpp;
+	struct hidpp_device *owner_hidpp;/* hidpp that allocated this ff_data */
 	struct hid_device *ff_hdev;	/* hid_device for interface 2 (FFB) */
 	struct input_dev *input;
 	struct workqueue_struct *wq;	/* Workqueue for async USB transfers */
@@ -3867,6 +3868,7 @@ struct rs50_ff_data {
 	struct rs50_ff_position_history pos_history;
 	s32 last_force;			/* Last force sent (for smoothing) */
 	s32 constant_force;		/* Current constant force from games */
+	s32 last_wheel_position;	/* Cached wheel position from raw_event (signed, centered at 0) */
 
 	/* D-pad state tracking (per-device, not static) */
 	int last_dpad_x;
@@ -3874,6 +3876,7 @@ struct rs50_ff_data {
 
 	/* Track whether we opened HID device for runtime HID++ communication */
 	bool hid_open;
+	bool ff_hdev_open;	/* Track whether interface 2 is open for FFB I/O */
 };
 
 /* Maximum pending work items to prevent memory exhaustion */
@@ -3891,6 +3894,7 @@ static void rs50_ff_effect_timer_callback(struct timer_list *t);
 static void rs50_setup_dpad(struct input_dev *input);
 static int rs50_process_dpad(struct hidpp_device *hidpp, u8 *data, int size);
 static void rs50_process_pedals(struct hidpp_device *hidpp, u8 *data, int size);
+static struct rs50_ff_data *rs50_find_ff_data(struct hid_device *hdev);
 
 /*
  * Update position history for velocity/acceleration calculation.
@@ -3978,11 +3982,18 @@ static s32 rs50_ff_calc_condition_force(struct rs50_ff_data *ff,
 	left_sat = cond->left_saturation;
 	right_sat = cond->right_saturation;
 
+	pr_info_ratelimited("hid_logitech_hidpp: RS50 spring calc: pos=%d center=%d lcoef=%d rcoef=%d lsat=%d rsat=%d db=%d\n",
+			   position, center, left_coeff, right_coeff, left_sat, right_sat, deadband);
+
 	/* Determine the metric based on effect type */
 	switch (effect->type) {
 	case FF_SPRING:
-		/* Spring: force based on displacement from center */
-		metric = position - center;
+		/*
+		 * Spring: force based on displacement from center.
+		 * Negate so positive displacement produces negative force
+		 * (pushes wheel back toward center).
+		 */
+		metric = -(position - center);
 		break;
 	case FF_DAMPER:
 		/* Damper: force based on velocity (resists movement) */
@@ -4048,6 +4059,18 @@ static s32 rs50_ff_calculate_total_force(struct rs50_ff_data *ff, s32 position)
 	/* Add constant force from games */
 	total_force = ff->constant_force;
 
+	/* Debug: count active effects */
+	{
+		int uploaded_count = 0, playing_count = 0;
+		for (i = 0; i < RS50_FF_MAX_EFFECTS; i++) {
+			if (ff->effects[i].uploaded) uploaded_count++;
+			if (ff->effects[i].playing) playing_count++;
+		}
+		if (uploaded_count > 0 || playing_count > 0)
+			pr_info_ratelimited("hid_logitech_hidpp: RS50 effects: uploaded=%d playing=%d\n",
+					   uploaded_count, playing_count);
+	}
+
 	/* Sum all active condition effects */
 	for (i = 0; i < RS50_FF_MAX_EFFECTS; i++) {
 		struct rs50_ff_effect *eff = &ff->effects[i];
@@ -4086,38 +4109,28 @@ static s32 rs50_ff_calculate_total_force(struct rs50_ff_data *ff, s32 position)
 static void rs50_ff_effect_timer_callback(struct timer_list *t)
 {
 	struct rs50_ff_data *ff = container_of(t, struct rs50_ff_data, effect_timer);
-	struct input_dev *input;
 	s32 position, force;
 
 	if (!ff || atomic_read_acquire(&ff->stopping) || !atomic_read(&ff->initialized))
 		return;
 
 	/*
-	 * Get a local copy of the input pointer using READ_ONCE.
-	 * This protects against the input device being freed between
-	 * the NULL check and the dereference. If input becomes NULL
-	 * during destroy, we'll see it and exit safely.
+	 * Read wheel position directly from input device.
+	 * We poll this on every timer tick since raw_event callbacks
+	 * aren't reliably delivered to our driver for the joystick interface.
 	 */
-	input = READ_ONCE(ff->input);
-	if (!input)
-		return;
-
-	/*
-	 * Verify the input device has ABS_X capability and absinfo is valid.
-	 * Without this check, accessing absinfo[ABS_X] can cause a crash
-	 * if the device doesn't have absolute axis support configured.
-	 */
-	if (!input->absinfo || !test_bit(ABS_X, input->absbit)) {
-		/* No ABS_X support - don't reschedule timer */
-		return;
+	position = 0;
+	if (ff->input) {
+		struct input_dev *input = READ_ONCE(ff->input);
+		if (input) {
+			s32 raw = input_abs_get_val(input, ABS_X);
+			/* Debug: log input device info */
+			if ((jiffies % 500) == 0)
+				pr_info("RS50: input=%px name=%s raw=%d\n",
+					input, input->name ? input->name : "NULL", raw);
+			position = raw - 0x8000; /* Convert to signed centered at 0 */
+		}
 	}
-
-	/* Read current wheel position from input device */
-	position = input->absinfo[ABS_X].value;
-
-	/* Normalize: input is 0x0000-0xFFFF, convert to signed for calculations */
-	/* Center (0x8000) becomes 0, left (0x0000) becomes -0x8000, right (0xFFFF) becomes +0x7FFF */
-	position = position - 0x8000;
 
 	/* Update position history */
 	rs50_ff_update_position(ff, position);
@@ -4125,8 +4138,14 @@ static void rs50_ff_effect_timer_callback(struct timer_list *t)
 	/* Calculate total force from all active effects */
 	force = rs50_ff_calculate_total_force(ff, position);
 
-	/* Only send if force changed significantly (reduces USB traffic) */
-	if (abs(force - ff->last_force) > 64) {
+	/* Debug: log timer activity (throttled to every ~1 second) */
+	if ((jiffies % 100) == 0)
+		pr_info("RS50 timer: pos=%d force=%d last=%d delta=%d\n",
+			position, force, ff->last_force, abs(force - ff->last_force));
+
+	/* Only send if force changed (threshold reduces USB traffic while maintaining responsiveness) */
+	if (abs(force - ff->last_force) > 32) {
+		pr_info("RS50 timer: SENDING force=%d (was %d)\n", force, ff->last_force);
 		rs50_ff_send_force(ff, force);
 		ff->last_force = force;
 	}
@@ -4157,6 +4176,7 @@ static void rs50_ff_send_force(struct rs50_ff_data *ff, s32 force)
 		return;
 
 	/* Convert from signed to offset binary */
+	/* Positive force = right (0xFFFF), negative = left (0x0000), zero = center (0x8000) */
 	ff_work->force = (s16)force + 0x8000;
 	ff_work->ff_data = ff;
 	INIT_WORK(&ff_work->work, rs50_ff_work_handler);
@@ -4186,7 +4206,7 @@ static int rs50_ff_upload(struct input_dev *dev, struct ff_effect *effect,
 		ff->effects[id].playing = false;
 	spin_unlock_irqrestore(&ff->effects_lock, flags);
 
-	hid_dbg(ff->hidpp->hid_dev, "RS50: Uploaded effect %d type=%d\n", id, effect->type);
+	pr_info("hid_logitech_hidpp: RS50 upload: id=%d type=%d\n", id, effect->type);
 	return 0;
 }
 
@@ -4219,6 +4239,8 @@ static int rs50_ff_playback(struct input_dev *dev, int id, int value)
 	struct rs50_ff_data *ff = dev->ff->private;
 	unsigned long flags;
 
+	pr_info("hid_logitech_hidpp: RS50 playback: id=%d value=%d\n", id, value);
+
 	if (!ff || id < 0 || id >= RS50_FF_MAX_EFFECTS)
 		return -EINVAL;
 
@@ -4226,17 +4248,34 @@ static int rs50_ff_playback(struct input_dev *dev, int id, int value)
 
 	if (!ff->effects[id].uploaded) {
 		spin_unlock_irqrestore(&ff->effects_lock, flags);
+		pr_info("hid_logitech_hidpp: RS50 playback: effect %d not uploaded\n", id);
 		return -EINVAL;
 	}
 
 	ff->effects[id].playing = (value != 0);
+	pr_info("hid_logitech_hidpp: RS50 playback: effect %d type=%d playing=%d\n",
+		id, ff->effects[id].effect.type, ff->effects[id].playing);
 
 	/* For constant effects, update the constant_force field */
 	if (ff->effects[id].effect.type == FF_CONSTANT) {
 		if (value) {
 			s32 level = ff->effects[id].effect.u.constant.level;
-			/* Apply direction */
-			level = (level * fixp_sin16((ff->effects[id].effect.direction * 360) >> 16)) >> 15;
+			u16 dir = ff->effects[id].effect.direction;
+
+			/*
+			 * For wheel devices, most games use direction 0 with
+			 * signed level values. Handle common cases directly:
+			 * - dir 0 (South/toward): use level as-is
+			 * - dir 0x8000 (North/away): invert level
+			 * - Other directions: apply sin projection for X axis
+			 */
+			if (dir == 0) {
+				/* Level directly controls force */
+			} else if (dir == 0x8000) {
+				level = -level;
+			} else {
+				level = (level * fixp_sin16((dir * 360) >> 16)) >> 15;
+			}
 			ff->constant_force = level;
 		} else {
 			/* Check if any other constant effects are playing */
@@ -4248,8 +4287,15 @@ static int rs50_ff_playback(struct input_dev *dev, int id, int value)
 				    ff->effects[i].playing &&
 				    ff->effects[i].effect.type == FF_CONSTANT) {
 					s32 level = ff->effects[i].effect.u.constant.level;
+					u16 dir = ff->effects[i].effect.direction;
 
-					level = (level * fixp_sin16((ff->effects[i].effect.direction * 360) >> 16)) >> 15;
+					if (dir == 0) {
+						/* Level directly controls force */
+					} else if (dir == 0x8000) {
+						level = -level;
+					} else {
+						level = (level * fixp_sin16((dir * 360) >> 16)) >> 15;
+					}
 					ff->constant_force += level;
 				}
 			}
@@ -4258,7 +4304,14 @@ static int rs50_ff_playback(struct input_dev *dev, int id, int value)
 
 	spin_unlock_irqrestore(&ff->effects_lock, flags);
 
-	hid_dbg(ff->hidpp->hid_dev, "RS50: Playback effect %d value=%d\n", id, value);
+	/* Send constant force immediately for instant response */
+	if (ff->effects[id].effect.type == FF_CONSTANT) {
+		rs50_ff_send_force(ff, ff->constant_force);
+		ff->last_force = ff->constant_force;
+	}
+
+	hid_dbg(ff->hidpp->hid_dev, "RS50: Playback effect %d value=%d constant_force=%d\n",
+		id, value, ff->constant_force);
 	return 0;
 }
 
@@ -4338,6 +4391,10 @@ static void rs50_ff_work_handler(struct work_struct *work)
 			ff->last_err_log = jiffies;
 			ff->err_count++;
 		}
+	} else {
+		hid_dbg(hdev, "RS50: FFB sent force=%d (0x%04X) seq=%d ret=%d\n",
+			(int)ff_work->force - 0x8000, ff_work->force,
+			report->sequence, ret);
 	}
 
 	/*
@@ -4866,6 +4923,19 @@ static void rs50_ff_init_work(struct work_struct *work)
 
 	/* Initialize position history */
 	memset(&ff->pos_history, 0, sizeof(ff->pos_history));
+
+	/*
+	 * Open interface 2's HID device for FFB I/O.
+	 * This enables hid_hw_output_report() to send FFB commands.
+	 * Without this, output reports to interface 2 will fail silently.
+	 */
+	ret = hid_hw_open(ff_hdev);
+	if (ret) {
+		hid_err(hid, "RS50: Cannot open FFB interface (error %d) - FFB disabled\n", ret);
+		input_ff_destroy(input);
+		return;
+	}
+	ff->ff_hdev_open = true;
 
 	/* Mark as fully initialized - timer was already set up in rs50_ff_init() */
 	atomic_set(&ff->initialized, 1);
@@ -7169,6 +7239,19 @@ static int rs50_ff_init(struct hidpp_device *hidpp)
 		return -ENODEV;
 	}
 
+	/*
+	 * Check if ff_data already exists on a sibling interface.
+	 * The RS50 has 3 HID interfaces and probe runs for each one.
+	 * We only want ONE ff_data instance with ONE timer.
+	 */
+	ff = rs50_find_ff_data(hid);
+	if (ff) {
+		hid_info(hid, "RS50: FF data already exists on sibling, skipping init\n");
+		/* Store reference so this interface can use the shared ff_data */
+		hidpp->private_data = ff;
+		return 0;
+	}
+
 	hid_dbg(hid, "RS50: Allocating FF data\n");
 	/* Allocate private data */
 	ff = kzalloc(sizeof(*ff), GFP_KERNEL);
@@ -7184,6 +7267,7 @@ static int rs50_ff_init(struct hidpp_device *hidpp)
 	}
 
 	ff->hidpp = hidpp;
+	ff->owner_hidpp = hidpp;	/* Track who allocated for cleanup */
 	ff->range = 1080;	/* RS50 default: 1080 degrees */
 	ff->strength = 65535;	/* Default: 100% */
 	ff->damping = 0;	/* Default: 0% */
@@ -7223,6 +7307,7 @@ static int rs50_ff_init(struct hidpp_device *hidpp)
 
 	ff->constant_force = 0;
 	ff->last_force = 0;
+	ff->last_wheel_position = 0;
 	spin_lock_init(&ff->effects_lock);
 	atomic_set(&ff->sequence, 0);
 	atomic_set(&ff->pending_work, 0);
@@ -7376,6 +7461,15 @@ static void rs50_ff_destroy(struct hidpp_device *hidpp)
 	 */
 	WRITE_ONCE(hidpp->private_data, NULL);
 
+	/*
+	 * Only the owner that allocated ff_data should do full cleanup.
+	 * Other interfaces may share the ff_data pointer but shouldn't free it.
+	 */
+	if (ff->owner_hidpp != hidpp) {
+		hid_dbg(hid, "RS50: Not ff owner, skipping full cleanup\n");
+		return;
+	}
+
 	hid_dbg(hid, "RS50: Setting stopping flag\n");
 	/*
 	 * Signal shutdown to prevent new work and allow in-progress work
@@ -7476,9 +7570,14 @@ static void rs50_ff_destroy(struct hidpp_device *hidpp)
 	destroy_workqueue(ff->wq);
 
 	/*
-	 * Note: hid_hw_close() is called in hidpp_remove() BEFORE hid_hw_stop()
-	 * to maintain correct ordering. We don't close it here.
+	 * Close interface 2's HID device if we opened it.
+	 * Note: hid_hw_close() for interface 1 is called in hidpp_remove()
+	 * BEFORE hid_hw_stop() to maintain correct ordering.
 	 */
+	if (ff->ff_hdev_open && ff->ff_hdev) {
+		hid_hw_close(ff->ff_hdev);
+		ff->ff_hdev_open = false;
+	}
 
 	hid_dbg(hid, "RS50: Freeing resources\n");
 	/* Clear pointers to prevent use-after-free */
@@ -7961,11 +8060,130 @@ static int hidpp_raw_hidpp_event(struct hidpp_device *hidpp, u8 *data,
 	return 0;
 }
 
+/*
+ * Find RS50 FF data from any interface by searching sibling interfaces.
+ * This is needed because joystick reports come on interface 0, which has
+ * no hidpp structure, but we need to update the wheel position in the
+ * FF data stored on interface 1.
+ */
+static struct rs50_ff_data *rs50_find_ff_data(struct hid_device *hdev)
+{
+	struct usb_interface *intf;
+	struct usb_device *udev;
+	int i;
+
+	if (!hid_is_usb(hdev)) {
+		hid_dbg(hdev, "RS50: find_ff_data: not USB device\n");
+		return NULL;
+	}
+
+	intf = to_usb_interface(hdev->dev.parent);
+	udev = interface_to_usbdev(intf);
+
+	/* Search all interfaces for the one with RS50 FF data */
+	for (i = 0; i < USB_MAXINTERFACES; i++) {
+		struct usb_interface *sibling = usb_ifnum_to_if(udev, i);
+		struct hid_device *sibling_hid;
+		struct hidpp_device *sibling_hidpp;
+
+		if (!sibling || !sibling->dev.driver)
+			continue;
+
+		/* Check if this interface has an hid_device */
+		sibling_hid = usb_get_intfdata(sibling);
+		if (!sibling_hid) {
+			hid_dbg(hdev, "RS50: find_ff_data: intf %d no hid_device\n", i);
+			continue;
+		}
+
+		sibling_hidpp = hid_get_drvdata(sibling_hid);
+		hid_dbg(hdev, "RS50: find_ff_data: intf %d hidpp=%p private=%p quirks=0x%lx\n",
+			i, sibling_hidpp,
+			sibling_hidpp ? sibling_hidpp->private_data : NULL,
+			sibling_hidpp ? sibling_hidpp->quirks : 0);
+
+		if (sibling_hidpp && sibling_hidpp->private_data &&
+		    (sibling_hidpp->quirks & HIDPP_QUIRK_RS50_FFB)) {
+			struct rs50_ff_data *ff = sibling_hidpp->private_data;
+			/*
+			 * Check if the FF subsystem is shutting down.
+			 * This prevents use-after-free when rmmod races with
+			 * raw_event callbacks on sibling interfaces.
+			 */
+			if (atomic_read_acquire(&ff->stopping)) {
+				hid_dbg(hdev, "RS50: find_ff_data: intf %d is stopping\n", i);
+				return NULL;
+			}
+			hid_dbg(hdev, "RS50: find_ff_data: FOUND on intf %d\n", i);
+			return ff;
+		}
+	}
+
+	hid_dbg(hdev, "RS50: find_ff_data: NOT FOUND\n");
+	return NULL;
+}
+
 static int hidpp_raw_event(struct hid_device *hdev, struct hid_report *report,
 		u8 *data, int size)
 {
 	struct hidpp_device *hidpp = hid_get_drvdata(hdev);
 	int ret = 0;
+
+	/* UNCONDITIONAL debug to verify raw_event is called */
+	{
+		static unsigned long last_unconditional;
+		if (time_after(jiffies, last_unconditional + HZ)) {
+			pr_info("hidpp_raw_event CALLED: product=0x%04x size=%d\n",
+				hdev->product, size);
+			last_unconditional = jiffies;
+		}
+	}
+
+	/* Temporary debug: log all RS50 raw_events to trace sizes */
+	if (hdev->product == USB_DEVICE_ID_LOGITECH_RS50) {
+		static unsigned long last_trace;
+		if (time_after(jiffies, last_trace + HZ/2)) {
+			hid_info(hdev, "RS50 raw_event: size=%d priv=%p (expect %d)\n",
+				 size, hidpp ? hidpp->private_data : NULL,
+				 RS50_INPUT_REPORT_SIZE);
+			last_trace = jiffies;
+		}
+	}
+
+	/*
+	 * RS50 joystick reports come on interface 0 which may have hidpp
+	 * allocated but NOT the FFB private_data (that's on interface 1).
+	 * Handle wheel position update for any interface that receives
+	 * joystick-sized reports but doesn't own the FFB data.
+	 */
+	if (hdev->product == USB_DEVICE_ID_LOGITECH_RS50 &&
+	    size == RS50_INPUT_REPORT_SIZE &&
+	    (!hidpp || !hidpp->private_data)) {
+		struct rs50_ff_data *ff = rs50_find_ff_data(hdev);
+		static unsigned long last_debug;
+
+		/* Debug: log entry (throttled to once per second) */
+		if (time_after(jiffies, last_debug + HZ)) {
+			hid_info(hdev, "RS50: intf0 raw_event hidpp=%p priv=%p ff=%p\n",
+				 hidpp, hidpp ? hidpp->private_data : NULL, ff);
+			last_debug = jiffies;
+		}
+
+		if (ff && !atomic_read_acquire(&ff->stopping)) {
+			u16 wheel_raw = get_unaligned_le16(&data[4]);
+			s32 wheel_pos = (s32)wheel_raw - 0x8000;
+
+			WRITE_ONCE(ff->last_wheel_position, wheel_pos);
+			/* Debug: log position update (throttled) */
+			if (time_after(jiffies, last_debug + HZ/2)) {
+				hid_info(hdev, "RS50: pos update raw=%u pos=%d\n",
+					 wheel_raw, wheel_pos);
+			}
+		} else if (time_after(jiffies, last_debug + HZ)) {
+			hid_info(hdev, "RS50: intf0 no ff or stopping ff=%p\n", ff);
+		}
+		return 0;
+	}
 
 	if (!hidpp)
 		return 0;
@@ -8114,6 +8332,15 @@ static int rs50_process_dpad(struct hidpp_device *hidpp, u8 *data, int size)
 
 	/* Only report if changed (use per-device state, not static) */
 	if (dpad_x != ff->last_dpad_x || dpad_y != ff->last_dpad_y) {
+		/*
+		 * Re-check stopping flag with acquire semantics before using
+		 * the input device. This closes the race window where destroy
+		 * sets stopping=1 then clears ff->input, but we already read
+		 * input before seeing stopping=1.
+		 */
+		if (atomic_read_acquire(&ff->stopping))
+			return 0;
+
 		input_report_abs(input, ABS_HAT0X, dpad_x);
 		input_report_abs(input, ABS_HAT0Y, dpad_y);
 		input_sync(input);
@@ -8222,6 +8449,19 @@ static void rs50_process_pedals(struct hidpp_device *hidpp, u8 *data, int size)
 	if (size < 12)
 		return;
 
+	/*
+	 * Update cached wheel position for the FFB timer.
+	 * This avoids the timer having to read from input->absinfo directly,
+	 * which can cause deadlocks with the input subsystem.
+	 * Wheel position is at offset 4-5 (u16 LE), range 0x0000-0xFFFF.
+	 * Convert to signed: center (0x8000) becomes 0.
+	 */
+	{
+		u16 wheel_raw = get_unaligned_le16(&data[4]);
+		s32 wheel_pos = (s32)wheel_raw - 0x8000;
+		WRITE_ONCE(ff->last_wheel_position, wheel_pos);
+	}
+
 	/* Read current pedal values (little-endian) */
 	throttle = get_unaligned_le16(&data[6]);
 	brake = get_unaligned_le16(&data[8]);
@@ -8281,14 +8521,45 @@ static void rs50_process_pedals(struct hidpp_device *hidpp, u8 *data, int size)
 static int hidpp_event(struct hid_device *hdev, struct hid_field *field,
 	struct hid_usage *usage, __s32 value)
 {
-	/* This function will only be called for scroll events, due to the
-	 * restriction imposed in hidpp_usages.
-	 */
 	struct hidpp_device *hidpp = hid_get_drvdata(hdev);
 	struct hidpp_scroll_counter *counter;
 
+	/* Debug: log ALL hidpp_event calls */
+	{
+		static unsigned long last_event_debug;
+		if (time_after(jiffies, last_event_debug + HZ)) {
+			pr_info("hidpp_event CALLED: product=0x%04x type=%d code=%d value=%d\n",
+				hdev->product, usage->type, usage->code, value);
+			last_event_debug = jiffies;
+		}
+	}
+
 	if (!hidpp)
 		return 0;
+
+	/*
+	 * Handle RS50 steering wheel position updates.
+	 * This captures ABS_X events from the joystick interface.
+	 */
+	if ((hidpp->quirks & HIDPP_QUIRK_RS50_FFB) &&
+	    usage->type == EV_ABS && usage->code == ABS_X) {
+		struct rs50_ff_data *ff = READ_ONCE(hidpp->private_data);
+
+		if (ff && !atomic_read_acquire(&ff->stopping)) {
+			/* Convert from 0-65535 to signed -32768 to 32767 */
+			s32 wheel_pos = value - 0x8000;
+			static unsigned long last_debug;
+
+			WRITE_ONCE(ff->last_wheel_position, wheel_pos);
+
+			if (time_after(jiffies, last_debug + HZ)) {
+				pr_info("RS50 event: ABS_X value=%d pos=%d\n",
+					value, wheel_pos);
+				last_debug = jiffies;
+			}
+		}
+		return 0; /* Let input subsystem also process it */
+	}
 
 	counter = &hidpp->vertical_wheel_counter;
 	/* A scroll event may occur before the multiplier has been retrieved or
@@ -8668,7 +8939,7 @@ static int hidpp_probe(struct hid_device *hdev, const struct hid_device_id *id)
 {
 	struct hidpp_device *hidpp;
 	int ret;
-	unsigned int connect_mask = HID_CONNECT_DEFAULT;
+	unsigned int connect_mask = HID_CONNECT_DEFAULT | HID_CONNECT_DRIVER;
 
 	/* report_fixup needs drvdata to be set before we call hid_parse */
 	hidpp = devm_kzalloc(&hdev->dev, sizeof(*hidpp), GFP_KERNEL);
@@ -8687,14 +8958,26 @@ static int hidpp_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	}
 
 	/*
-	 * Make sure the device is HID++ capable, otherwise treat as generic HID
+	 * Make sure the device is HID++ capable, otherwise treat as generic HID.
+	 * Exception: RS50 interface 0 (joystick) has no HID++ but we need to
+	 * keep our driver active to receive raw_event for position tracking.
 	 */
 	hidpp->supported_reports = hidpp_validate_device(hdev);
 
 	if (!hidpp->supported_reports) {
-		hid_set_drvdata(hdev, NULL);
-		devm_kfree(&hdev->dev, hidpp);
-		return hid_hw_start(hdev, HID_CONNECT_DEFAULT);
+		/*
+		 * RS50 has 3 interfaces: 0=joystick, 1=HID++, 2=FFB output.
+		 * Interface 0 fails validation but we need raw_event for
+		 * wheel position updates. Keep hidpp but mark it as non-HID++.
+		 */
+		if (hdev->product == USB_DEVICE_ID_LOGITECH_RS50) {
+			hid_info(hdev, "RS50: Interface without HID++, keeping for raw_event\n");
+			/* Continue with probe to ensure raw_event is called */
+		} else {
+			hid_set_drvdata(hdev, NULL);
+			devm_kfree(&hdev->dev, hidpp);
+			return hid_hw_start(hdev, HID_CONNECT_DEFAULT);
+		}
 	}
 
 	if (id->group == HID_GROUP_LOGITECH_27MHZ_DEVICE &&
@@ -8750,10 +9033,13 @@ static int hidpp_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	hid_device_io_start(hdev);
 
 	/* Get name + serial, store in hdev->name + hdev->uniq */
+	/* Skip HID++ queries for RS50 interfaces without HID++ support */
 	if (id->group == HID_GROUP_LOGITECH_DJ_DEVICE)
 		hidpp_unifying_init(hidpp);
-	else
+	else if (hidpp->supported_reports)
 		hidpp_non_unifying_init(hidpp);
+	else if (hdev->product == USB_DEVICE_ID_LOGITECH_RS50)
+		hid_info(hdev, "RS50: Skipping HID++ init for non-HID++ interface\n");
 
 	if (hidpp->quirks & HIDPP_QUIRK_DELAYED_INIT)
 		connect_mask &= ~HID_CONNECT_HIDINPUT;
@@ -8776,11 +9062,18 @@ static int hidpp_probe(struct hid_device *hdev, const struct hid_device_id *id)
 			/*
 			 * RS50 uses dedicated endpoint FFB, not HID++ feature 0x8123.
 			 * Skip G920 config and use RS50-specific initialization.
+			 * IMPORTANT: Only init FFB on interface with HID++ support
+			 * (interface 1), not the joystick interface (interface 0).
 			 */
-			ret = rs50_ff_init(hidpp);
-			if (ret)
-				hid_warn(hidpp->hid_dev,
-					 "RS50: Force feedback setup failed (error %d)\n", ret);
+			if (hidpp->supported_reports) {
+				ret = rs50_ff_init(hidpp);
+				if (ret)
+					hid_warn(hidpp->hid_dev,
+						 "RS50: Force feedback setup failed (error %d)\n", ret);
+			} else {
+				hid_info(hidpp->hid_dev,
+					 "RS50: Skipping FFB init on non-HID++ interface\n");
+			}
 		} else {
 			struct hidpp_ff_private_data data;
 
@@ -8798,8 +9091,16 @@ static int hidpp_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	/*
 	 * This relies on logi_dj_ll_close() being a no-op so that DJ connection
 	 * events will still be received.
+	 *
+	 * For RS50, keep the joystick interface (no HID++ support) open so we
+	 * continue receiving raw_event callbacks for wheel position updates.
 	 */
-	hid_hw_close(hdev);
+	if (!(hdev->product == USB_DEVICE_ID_LOGITECH_RS50 &&
+	      !hidpp->supported_reports)) {
+		hid_hw_close(hdev);
+	} else {
+		hid_info(hdev, "RS50: Keeping interface open for raw_event\n");
+	}
 	return ret;
 
 hid_hw_init_fail:
@@ -8822,13 +9123,18 @@ static void hidpp_remove(struct hid_device *hdev)
 		return hid_hw_stop(hdev);
 
 	/*
-	 * RS50 cleanup: Close the HID device BEFORE hid_hw_stop().
-	 * The RS50 driver calls hid_hw_open() to keep the device active
-	 * for HID++ communication. We must close it before stopping.
+	 * RS50 cleanup: Set stopping flag FIRST to prevent cross-interface
+	 * lookups from accessing our data while we're tearing down.
+	 * This must happen before hid_hw_stop() because sibling interfaces
+	 * (like interface 0 receiving joystick input) may still be active
+	 * and calling rs50_find_ff_data().
 	 */
 	if (hidpp->quirks & HIDPP_QUIRK_RS50_FFB) {
 		ff = READ_ONCE(hidpp->private_data);
 		if (ff) {
+			/* Signal shutdown immediately */
+			atomic_set_release(&ff->stopping, 1);
+
 			if (ff->hid_open) {
 				hid_hw_close(hdev);
 				ff->hid_open = false;
@@ -9018,7 +9324,8 @@ MODULE_DEVICE_TABLE(hid, hidpp_devices);
 
 static const struct hid_usage_id hidpp_usages[] = {
 	{ HID_GD_WHEEL, EV_REL, REL_WHEEL_HI_RES },
-	{ HID_ANY_ID - 1, HID_ANY_ID - 1, HID_ANY_ID - 1}
+	{ HID_GD_X, EV_ABS, ABS_X },  /* RS50 steering wheel position */
+	{ HID_ANY_ID, HID_ANY_ID, HID_ANY_ID}  /* Match all usages for debugging */
 };
 
 static struct hid_driver hidpp_driver = {

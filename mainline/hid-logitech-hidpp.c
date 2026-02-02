@@ -3746,7 +3746,7 @@ struct rs50_lightsync_slot {
  * FF_SPRING, FF_DAMPER, FF_FRICTION, and FF_INERTIA ourselves.
  */
 #define RS50_FF_MAX_EFFECTS		16	/* Max simultaneous effects */
-#define RS50_FF_TIMER_INTERVAL_MS	10	/* 100 Hz update rate for condition effects */
+#define RS50_FF_TIMER_INTERVAL_MS	2	/* 500 Hz update rate for condition effects */
 
 /*
  * RS50 pedal response curve types.

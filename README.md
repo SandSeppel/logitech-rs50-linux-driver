@@ -14,7 +14,7 @@
 
 Linux kernel driver for the **Logitech RS50 Direct Drive Wheel Base** (USB ID `046d:c276`).
 
-This is a patched version of the `hid-logitech-hidpp` driver that adds RS50 support with full force feedback, including condition effects, and exposes all G Hub settings via sysfs for runtime configuration.
+This is a patched version of the `hid-logitech-hidpp` driver that adds RS50 support with force feedback (FF_CONSTANT) and exposes all G Hub settings via sysfs for runtime configuration.
 
 **Note:** This driver replaces the in-kernel `hid-logitech-hidpp` module and continues to support all other Logitech HID++ devices (mice, keyboards, other racing wheels like the G29, G920, G923, etc.).
 
@@ -23,11 +23,8 @@ This is a patched version of the `hid-logitech-hidpp` driver that adds RS50 supp
 ## Features
 
 - **Force Feedback**
-  - FF_CONSTANT: Standard constant force
-  - FF_SPRING: Centering spring effect
-  - FF_DAMPER: Velocity-based resistance
-  - FF_FRICTION: Constant directional resistance
-  - FF_INERTIA: Acceleration-based resistance
+  - FF_CONSTANT: Constant force effects (used by all modern racing games)
+  - FF_GAIN: Master gain control
 
 - **Complete Input Support**
   - All 17 buttons mapped
@@ -138,7 +135,7 @@ sudo modprobe hid-logitech-hidpp
 dmesg | grep -i "rs50"
 ```
 
-You should see: `RS50 force feedback initialized with condition effects support`
+You should see: `RS50: Force feedback initialized (FF_CONSTANT only)`
 
 ### Quick Test (Without DKMS)
 
@@ -245,7 +242,7 @@ The driver exposes standard wheel attributes for [Oversteer](https://github.com/
 - `combine_pedals` - Combined pedals mode
 - `damper_level` - Damping level
 
-> **Note on autocenter:** The `autocenter` attribute is a stub that stores values locally but doesn't communicate with the device. G Hub doesn't expose an autocenter setting for the RS50, and modern direct-drive wheels don't need hardware centering - games use FF_SPRING effects instead, which the driver fully supports.
+> **Note on autocenter:** The `autocenter` attribute is a stub that stores values locally but doesn't communicate with the device. G Hub doesn't expose an autocenter setting for the RS50, and modern direct-drive wheels don't need hardware centering - games calculate their own centering forces using FF_CONSTANT effects.
 
 **Note:** Oversteer requires a patch for RS50 support. This patch has been submitted upstream; until merged, you can apply it manually.
 

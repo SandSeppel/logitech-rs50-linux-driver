@@ -1,7 +1,7 @@
 # Logitech RS50 Protocol Specification
 
-**Document Version**: 5.6
-**Date**: 2026-02-01 (Interface initialization fix, architecture clarification)
+**Document Version**: 5.7
+**Date**: 2026-02-03 (FFB simplification, condition effects removed)
 **Author**: Verified from USB capture analysis
 **Status**: Working specification for Linux driver development
 
@@ -515,18 +515,11 @@ Recommended initialization order:
 1. **Multi-Interface Device**: Claim interface 2 for FFB, interface 0 for input
 2. **FFB via hid_hw_output_report()**: Send 64-byte reports to interface 2
 3. **Workqueue**: FFB must be sent from process context
-4. **Custom FF Handler**: Implements FF_CONSTANT plus condition effects (FF_SPRING, FF_DAMPER, FF_FRICTION, FF_INERTIA)
+4. **FF_CONSTANT only**: Modern racing games calculate their own physics and use FF_CONSTANT exclusively
 
-### Condition Effects Implementation
+### Timer-Based Force Updates
 
-The driver implements condition effects using a 250Hz timer:
-
-- **FF_SPRING**: Force = coefficient × (position - center). Centering force.
-- **FF_DAMPER**: Force = coefficient × velocity. Resists movement.
-- **FF_FRICTION**: Force = coefficient × sign(velocity). Constant resistance.
-- **FF_INERTIA**: Force = coefficient × acceleration. Resists speed changes.
-
-Position history tracks wheel position over 4 samples to calculate velocity and acceleration.
+The driver uses a 500Hz timer to send continuous force commands while an effect is active. The RS50 requires continuous commands to maintain force (unlike some wheels that hold state). Timer is on-demand: only runs when `constant_force != 0`.
 
 ### Settings Query on Init
 
@@ -1222,7 +1215,7 @@ The Linux driver exposes an `autocenter` sysfs attribute for compatibility with 
 
 2. **Modern direct-drive wheels don't need hardware autocenter** - Unlike older belt/gear-driven wheels that used hardware centering springs, direct-drive wheels like the RS50 can produce centering force purely through their motors.
 
-3. **Games implement their own centering** - Racing games and simulators send `FF_SPRING` force feedback effects to create centering force during gameplay. The Linux driver fully supports FF_SPRING, so games get proper centering behavior without needing a hardware autocenter feature.
+3. **Games implement their own centering** - Racing games and simulators calculate their own centering forces and send them via `FF_CONSTANT` effects. The driver fully supports this, so games get proper centering behavior without needing a hardware autocenter feature.
 
 4. **The stub serves Oversteer compatibility** - Oversteer's GUI expects the `autocenter` attribute to exist. The stub accepts values (0-100) and stores them locally, keeping the GUI happy without affecting device behavior.
 
@@ -1423,3 +1416,4 @@ This returns the PAGE ID at each index. G Hub queries indices 0x00 through ~0x1F
 | 5.4 | 2026-01-30 | **LIGHTSYNC WORKING**: Fixed LED initialization - now correctly queries features and applies settings on startup. LEDs illuminate with driver-configured colors. |
 | 5.5 | 2026-01-30 | Updated mode/profile capture analysis, expanded sysfs documentation. |
 | 5.6 | 2026-02-01 | **INTERFACE FIX**: Fixed wheel position tracking (was stuck at -32767). Root cause: FFB initialized on Interface 0 (joystick, no HID++) instead of Interface 1 (HID++). Solution: only call rs50_ff_init() when supported_reports != 0. Added architecture comparison with G920/G923 (they use HID++ Feature 0x8123, RS50 uses dedicated endpoint). |
+| 5.7 | 2026-02-03 | **FFB SIMPLIFICATION**: Removed unused condition effects code (~250 lines). Driver now supports FF_CONSTANT only, matching how modern racing games actually use FFB. Timer runs at 500Hz, on-demand only when force is non-zero. FFB fully working and tested. |

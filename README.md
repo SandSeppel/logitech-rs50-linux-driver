@@ -336,7 +336,7 @@ The RS50 is a multi-interface USB device:
 | Aspect | G920/G923 (Belt-driven) | RS50 (Direct-drive) |
 |--------|-------------------------|---------------------|
 | FFB Protocol | HID++ Feature 0x8123 | Dedicated USB endpoint |
-| FFB Commands | Via HID++ FAP messages | Raw HID output reports (05 XX) |
+| FFB Commands | Via HID++ FAP messages | Raw HID output reports (01 XX) |
 | Interface Layout | Unified | 3 separate interfaces |
 | Max Rotation | 900° | 2700° |
 

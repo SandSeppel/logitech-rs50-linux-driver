@@ -78,7 +78,7 @@ The driver remaps the face buttons, triggers, and paddles to standard gamepad co
 
 ## Requirements
 
-- Linux kernel 5.15+ (tested on 5.15, 6.1, 6.8, 6.12, 6.18)
+- Linux kernel 5.15+ (tested on 5.15, 6.8, 6.12, 6.18)
 - Kernel headers for your running kernel
 - Build tools: `make`, `clang` or `gcc`
 

@@ -49,7 +49,14 @@ jobs:
       - name: Install build dependencies
         run: |
           apt-get update
-          apt-get install -y build-essential linux-headers-generic kmod
+          # Find and install available kernel headers (avoid meta-package sync issues)
+          HEADERS=$(apt-cache search linux-headers | grep -E 'linux-headers-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic' | tail -1 | awk '{print $1}')
+          if [ -z "$HEADERS" ]; then
+            echo "No kernel headers found, trying generic meta-package..."
+            HEADERS="linux-headers-generic"
+          fi
+          echo "Installing: $HEADERS"
+          apt-get install -y build-essential "$HEADERS" kmod
 
       - name: Find kernel version
         id: kernel
@@ -83,7 +90,13 @@ jobs:
       - name: Install dependencies
         run: |
           apt-get update
-          apt-get install -y build-essential linux-headers-generic sparse
+          # Find and install available kernel headers (avoid meta-package sync issues)
+          HEADERS=$(apt-cache search linux-headers | grep -E 'linux-headers-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic' | tail -1 | awk '{print $1}')
+          if [ -z "$HEADERS" ]; then
+            HEADERS="linux-headers-generic"
+          fi
+          echo "Installing: $HEADERS"
+          apt-get install -y build-essential "$HEADERS" sparse
 
       - name: Find kernel version
         id: kernel
@@ -116,7 +129,13 @@ jobs:
       - name: Install dependencies
         run: |
           apt-get update
-          apt-get install -y build-essential linux-headers-generic git \
+          # Find and install available kernel headers (avoid meta-package sync issues)
+          HEADERS=$(apt-cache search linux-headers | grep -E 'linux-headers-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic' | tail -1 | awk '{print $1}')
+          if [ -z "$HEADERS" ]; then
+            HEADERS="linux-headers-generic"
+          fi
+          echo "Installing: $HEADERS"
+          apt-get install -y build-essential "$HEADERS" git \
             libsqlite3-dev libssl-dev libxml2-dev llvm clang
 
       - name: Build smatch

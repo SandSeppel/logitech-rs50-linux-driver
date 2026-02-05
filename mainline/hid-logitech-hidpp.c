@@ -6867,14 +6867,15 @@ static ssize_t rs50_profile_store(struct device *dev, struct device_attribute *a
 static DEVICE_ATTR(rs50_profile, 0664, rs50_profile_show, rs50_profile_store);
 
 /*
- * RS50 input mapping - ignore phantom buttons declared in HID descriptor.
+ * RS50 input mapping - filter phantom buttons declared in HID descriptor.
  *
  * The RS50 HID descriptor declares buttons 1-92 but only ~20 physically exist.
- * Buttons 81-92 overflow past Linux's valid input code range (max 767), causing
- * "Invalid code 768 type 1" kernel messages.
+ * Buttons 81+ overflow past Linux's valid input code range, causing kernel
+ * errors like "Invalid code 768 type 1".
  *
- * This function is called during input device setup. Returning -1 tells the
- * HID layer to ignore this usage (not create an input mapping for it).
+ * We only filter phantom buttons here and let HID core handle valid buttons
+ * with its default sequential joystick mapping (BTN_TRIGGER, BTN_THUMB, etc.).
+ * This maintains button index compatibility with Windows DirectInput.
  */
 static int rs50_input_mapping(struct hid_device *hdev, struct hid_input *hi,
 			      struct hid_field *field, struct hid_usage *usage,
@@ -6886,79 +6887,19 @@ static int rs50_input_mapping(struct hid_device *hdev, struct hid_input *hi,
 	if ((usage->hid & HID_USAGE_PAGE) != HID_UP_BUTTON)
 		return 0;
 
-	/* Get the button number (usage ID within Button page) */
 	button = usage->hid & HID_USAGE;
 
 	/*
-	 * Ignore buttons beyond the maximum that map to valid Linux codes.
-	 * Buttons 1-80 map to valid BTN_* codes, but 81+ overflow.
+	 * Filter phantom buttons that would overflow Linux input codes.
+	 * Buttons 1-80 map to valid BTN_JOYSTICK + n codes.
 	 */
 	if (button > RS50_MAX_BUTTON_USAGE) {
 		hid_dbg(hdev, "RS50: Ignoring phantom button %u\n", button);
-		return -1;	/* Ignore this usage */
+		return -1;
 	}
 
-	/*
-	 * Remap RS50 buttons to standard gamepad codes.
-	 * The RS50 uses generic HID joystick button usages which would
-	 * map to BTN_TRIGGER, BTN_THUMB, etc. We remap the common buttons
-	 * to gamepad codes (BTN_A, BTN_X, etc.) for better compatibility.
-	 *
-	 * HID Button -> Physical -> Linux Code
-	 * Button 1   -> A        -> BTN_A
-	 * Button 2   -> X        -> BTN_X
-	 * Button 3   -> B        -> BTN_B
-	 * Button 4   -> Y        -> BTN_Y
-	 * Button 5   -> R.Paddle -> BTN_TR2
-	 * Button 6   -> L.Paddle -> BTN_TL2
-	 * Button 7   -> RT       -> BTN_TR
-	 * Button 8   -> LT       -> BTN_TL
-	 * Button 9   -> Camera   -> BTN_SELECT
-	 * Button 10  -> Menu     -> BTN_START
-	 * Button 11  -> RSB      -> BTN_THUMBR
-	 * Button 12  -> LSB      -> BTN_THUMBL
-	 */
-	switch (button) {
-	case 1:  /* A */
-		hid_map_usage_clear(hi, usage, bit, max, EV_KEY, BTN_A);
-		return 1;
-	case 2:  /* X */
-		hid_map_usage_clear(hi, usage, bit, max, EV_KEY, BTN_X);
-		return 1;
-	case 3:  /* B */
-		hid_map_usage_clear(hi, usage, bit, max, EV_KEY, BTN_B);
-		return 1;
-	case 4:  /* Y */
-		hid_map_usage_clear(hi, usage, bit, max, EV_KEY, BTN_Y);
-		return 1;
-	case 5:  /* Right Paddle */
-		hid_map_usage_clear(hi, usage, bit, max, EV_KEY, BTN_TR2);
-		return 1;
-	case 6:  /* Left Paddle */
-		hid_map_usage_clear(hi, usage, bit, max, EV_KEY, BTN_TL2);
-		return 1;
-	case 7:  /* RT */
-		hid_map_usage_clear(hi, usage, bit, max, EV_KEY, BTN_TR);
-		return 1;
-	case 8:  /* LT */
-		hid_map_usage_clear(hi, usage, bit, max, EV_KEY, BTN_TL);
-		return 1;
-	case 9:  /* Camera/View */
-		hid_map_usage_clear(hi, usage, bit, max, EV_KEY, BTN_SELECT);
-		return 1;
-	case 10: /* Menu */
-		hid_map_usage_clear(hi, usage, bit, max, EV_KEY, BTN_START);
-		return 1;
-	case 11: /* RSB */
-		hid_map_usage_clear(hi, usage, bit, max, EV_KEY, BTN_THUMBR);
-		return 1;
-	case 12: /* LSB */
-		hid_map_usage_clear(hi, usage, bit, max, EV_KEY, BTN_THUMBL);
-		return 1;
-	default:
-		/* Let HID core handle remaining buttons (encoders, gear, G1) */
-		return 0;
-	}
+	/* Let HID core use default sequential joystick mapping */
+	return 0;
 }
 
 static int rs50_ff_init(struct hidpp_device *hidpp)

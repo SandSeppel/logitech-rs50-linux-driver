@@ -49,32 +49,33 @@ This is a patched version of the `hid-logitech-hidpp` driver that adds RS50 supp
 
 ![RS50 Button Layout](rs-wheel-hub-button-layout.png)
 
-The driver remaps the face buttons, triggers, and paddles to standard gamepad codes for better game compatibility.
+Buttons use sequential indices matching Windows DirectInput for cross-platform compatibility.
 
-| # | Button | Linux Input Code |
-|---|--------|------------------|
-| 1 | X | BTN_X |
-| 2 | Y | BTN_Y |
-| 3 | A | BTN_A |
-| 4 | B | BTN_B |
-| 5 | RT (Right Trigger) | BTN_TR |
-| 6 | RSB (Right Stick Button) | BTN_THUMBR |
-| 7 | GR (Gear Right) | BTN_TRIGGER_HAPPY14 |
-| 8₁ | Right Encoder Twist ↑ (CW) | BTN_TRIGGER_HAPPY6 |
-| 8₂ | Right Encoder Twist ↓ (CCW) | BTN_TRIGGER_HAPPY7 |
-| 8₃ | Right Encoder Push | BTN_TRIGGER_HAPPY8 |
-| 9 | Menu | BTN_START |
-| 10 | G1 | BTN_TRIGGER_HAPPY12 |
-| 11 | Camera | BTN_SELECT |
-| 12₁ | Left Encoder Twist ↑ (CW) | BTN_TRIGGER_HAPPY9 |
-| 12₂ | Left Encoder Twist ↓ (CCW) | BTN_TRIGGER_HAPPY10 |
-| 12₃ | Left Encoder Push | BTN_TRIGGER_HAPPY11 |
-| 13 | GL (Gear Left) | BTN_TRIGGER_HAPPY13 |
-| 14 | LSB (Left Stick Button) | BTN_THUMBL |
-| 15 | LT (Left Trigger) | BTN_TL |
-| 16 | Left Paddle (behind LT) | BTN_TL2 |
-| 17 | Right Paddle (behind RT) | BTN_TR2 |
-| D | D-pad (right of LT/LSB) | ABS_HAT0X / ABS_HAT0Y |
+| Index | Button |
+|-------|--------|
+| 0 | A |
+| 1 | X |
+| 2 | B |
+| 3 | Y |
+| 4 | Right Paddle / Gear Right |
+| 5 | Left Paddle / Gear Left |
+| 6 | RT (Right Trigger) |
+| 7 | LT (Left Trigger) |
+| 8 | Camera/View |
+| 9 | Menu |
+| 10 | RSB (Right Stick) |
+| 11 | LSB (Left Stick) |
+| 21 | Right Encoder CW |
+| 22 | Right Encoder CCW |
+| 23 | Right Encoder Push |
+| 24 | Left Encoder CW |
+| 25 | Left Encoder CCW |
+| 26 | Left Encoder Push |
+| 27 | G1 (Logitech logo) |
+
+D-pad reports as hat switch (ABS_HAT0X / ABS_HAT0Y).
+
+Note: Indices 12-20 are gaps in the HID descriptor (unused).
 
 ## Requirements
 

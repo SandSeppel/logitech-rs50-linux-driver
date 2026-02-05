@@ -1,0 +1,126 @@
+name: Bug Report
+description: Report a problem with the RS50 driver
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing and reporting issues!
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      description: What area does this bug affect?
+      options:
+        - Force Feedback
+        - Input (buttons/wheel/pedals)
+        - sysfs settings
+        - LED/LIGHTSYNC
+        - Driver loading/installation
+        - Other Logitech device regression
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened? What did you expect to happen?
+      placeholder: |
+        When I play Assetto Corsa, the FFB cuts out after about 5 minutes.
+        Expected: continuous FFB throughout the session.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: How can we reproduce this?
+      placeholder: |
+        1. Load the driver
+        2. Launch Assetto Corsa
+        3. Start a race
+        4. After ~5 minutes, FFB stops
+    validations:
+      required: true
+
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel Version
+      description: "Output of `uname -r`"
+      placeholder: "6.8.0-arch1-1"
+    validations:
+      required: true
+
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution
+      description: Your Linux distribution and version
+      placeholder: "Arch Linux / Ubuntu 24.04 / Fedora 40"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install_method
+    attributes:
+      label: Installation Method
+      options:
+        - DKMS
+        - Manual insmod
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: dmesg
+    attributes:
+      label: dmesg Output
+      description: |
+        Run `dmesg | grep -iE 'rs50|hidpp|logitech'` and paste the output.
+        Use a code block (triple backticks) for formatting.
+      placeholder: |
+        ```
+        [    5.123456] hid-logitech-hidpp 0003:046D:C276.0001: RS50: Force feedback initialized
+        ...
+        ```
+      render: shell
+
+  - type: textarea
+    id: sysfs
+    attributes:
+      label: Current sysfs Values (if relevant)
+      description: |
+        If the bug relates to settings, run:
+        `for f in /sys/class/hidraw/hidraw*/device/rs50_*; do echo "$f: $(cat $f 2>/dev/null)"; done`
+      render: shell
+
+  - type: textarea
+    id: game
+    attributes:
+      label: Game/Application
+      description: If this is FFB or input related, what game or tool are you using?
+      placeholder: |
+        Assetto Corsa Competizione via Proton 9.0
+        or
+        fftest /dev/input/event123
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I blacklisted the in-kernel hid-logitech-hidpp module
+        - label: I verified the driver loaded (`lsmod | grep hidpp`)
+        - label: I checked dmesg for errors
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Anything else that might help (screenshots, comparison with Windows behavior, etc.)

@@ -1,0 +1,82 @@
+name: USB Capture Submission
+description: Submit USB protocol captures for a Logitech wheel
+title: "[Capture] "
+labels: ["usb-capture", "protocol-analysis"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for contributing USB captures! This data helps us add support for new devices.
+
+        See the [USB Capture Guide](https://github.com/mescon/logitech-rs50-linux-driver/blob/master/docs/USB_CAPTURE_GUIDE.md) for detailed instructions.
+
+  - type: input
+    id: device_name
+    attributes:
+      label: Device Name
+      description: Full name of your Logitech wheel
+      placeholder: "Logitech G Pro Racing Wheel"
+    validations:
+      required: true
+
+  - type: input
+    id: usb_id
+    attributes:
+      label: USB Vendor/Product ID
+      description: "From Device Manager or lsusb (format: 046d:xxxx)"
+      placeholder: "046d:c272"
+    validations:
+      required: true
+
+  - type: input
+    id: ghub_version
+    attributes:
+      label: G Hub Version
+      description: Found in G Hub settings
+      placeholder: "2024.x.xxxxx"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: captures_included
+    attributes:
+      label: Captures Included
+      description: Which captures are you submitting?
+      options:
+        - label: G Hub initialization (ghub_init)
+        - label: FFB gameplay (ffb_gameplay)
+        - label: Rotation range sweep
+        - label: FFB strength sweep
+        - label: Damping sweep
+        - label: TRUEFORCE sweep
+        - label: Cold boot sequence
+        - label: Other (describe below)
+
+  - type: textarea
+    id: capture_notes
+    attributes:
+      label: Capture Notes
+      description: |
+        Describe what's in each capture file. For FFB gameplay, mention which game you used and what actions you performed.
+      placeholder: |
+        - ghub_init_gpro.pcapng: Started G Hub with wheel already connected
+        - ffb_gameplay_gpro.pcapng: 60 seconds of Assetto Corsa, drove Nordschleife with curbs and collisions
+        - rotation_range_gpro.pcapng: Swept from 360 to 900 degrees
+    validations:
+      required: true
+
+  - type: textarea
+    id: upload
+    attributes:
+      label: Capture Files
+      description: |
+        Attach your .pcapng files here, or provide a link to cloud storage (Google Drive, Dropbox, etc.) if they're too large.
+      placeholder: "Drag and drop files here or paste a link"
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Information
+      description: Anything else that might be useful (firmware version, special wheel configuration, etc.)

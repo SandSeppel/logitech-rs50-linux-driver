@@ -18,7 +18,7 @@ This is a patched version of the `hid-logitech-hidpp` driver that adds RS50 supp
 
 **Note:** This driver replaces the in-kernel `hid-logitech-hidpp` module and continues to support all other Logitech HID++ devices (mice, keyboards, other racing wheels like the G29, G920, G923, etc.).
 
-> **G Pro Racing Wheel Note:** The G Pro (046d:c272) is a direct-drive wheel like the RS50, but its FFB architecture is not yet confirmed. It may use either the standard HID++ Feature 0x8123 (like G920/G923) or dedicated endpoints (like RS50). Without USB protocol captures, we cannot add RS50-style FFB support for it.
+> **G Pro Racing Wheel Note:** The G Pro (046d:c272) is a direct-drive wheel like the RS50, but its FFB architecture is not yet confirmed. It may use either the standard HID++ Feature 0x8123 (like G920/G923) or dedicated endpoints (like RS50). If you own a G Pro and want to help, see our [USB Capture Guide](docs/USB_CAPTURE_GUIDE.md) for instructions on capturing the protocol data we need.
 
 ## Features
 
@@ -406,7 +406,13 @@ sudo lsof /dev/hidrawX
 
 ## Contributing
 
-Contributions are welcome! This driver is forked from [JacKeTUs/hid-logitech-hidpp](https://github.com/JacKeTUs/hid-logitech-hidpp) with RS50-specific additions. If your changes apply to other Logitech devices, please consider contributing upstream as well.
+Contributions are welcome! There are several ways to help:
+
+**Code contributions:** This driver is forked from [JacKeTUs/hid-logitech-hidpp](https://github.com/JacKeTUs/hid-logitech-hidpp) with RS50-specific additions. If your changes apply to other Logitech devices, please consider contributing upstream as well.
+
+**Testing:** Try the driver and report issues. Include your kernel version, distribution, and any relevant dmesg output.
+
+**USB captures:** Own a Logitech wheel that isn't fully supported (like the G Pro Racing Wheel)? You can help by capturing USB traffic from G Hub on Windows. No coding required. See the [USB Capture Guide](docs/USB_CAPTURE_GUIDE.md) for instructions.
 
 ## License
 

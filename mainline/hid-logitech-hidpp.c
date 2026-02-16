@@ -8854,12 +8854,12 @@ static const struct hid_device_id hidpp_devices[] = {
 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC091) },
 	{ /* Logitech G915 TKL Keyboard over USB */
 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, 0xC343) },
-	{ /* Logitech G920 Wheel over USB */
-	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_G920_WHEEL),
-		.driver_data = HIDPP_QUIRK_CLASS_G920 | HIDPP_QUIRK_FORCE_OUTPUT_REPORTS},
-	{ /* Logitech G923 Wheel (Xbox version) over USB */
-	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_G923_XBOX_WHEEL),
-		.driver_data = HIDPP_QUIRK_CLASS_G920 | HIDPP_QUIRK_FORCE_OUTPUT_REPORTS },
+	/*
+	 * Removed Logitech G920 and G923 wheel entries.  This driver is now
+	 * limited to supporting the Logitech RS50 wheel only.  Removing these
+	 * entries prevents the module from binding to G920/G923 devices while
+	 * keeping support for the RS50 (which relies on the same quirk bits).
+	 */
 	{ /* Logitech RS50 Direct Drive Wheel (PlayStation/PC) over USB */
 	  HID_USB_DEVICE(USB_VENDOR_ID_LOGITECH, USB_DEVICE_ID_LOGITECH_RS50),
 		.driver_data = HIDPP_QUIRK_CLASS_G920 | HIDPP_QUIRK_RS50_FFB },
